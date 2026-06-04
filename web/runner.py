@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import traceback
 from typing import Any
 
 from web.progress import PIPELINE_STAGES, ProgressTracker
@@ -101,6 +102,18 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
     tracker.mark_complete(last_chunk, signal)
 
 
+def _format_error(exc: Exception) -> str:
+    """Return a concise UI-facing error without losing the real API cause."""
+    message = str(exc)
+    if "Insufficient Balance" in message:
+        return "DeepSeek 账号余额不足，请充值或切换到有可用额度的 API Key/模型。"
+    if "Error code: 401" in message or "Unauthorized" in message:
+        return "API Key 无效或未授权，请检查 .env 中对应供应商的 Key。"
+    if "Error code: 429" in message or "rate limit" in message.lower():
+        return "API 调用触发限流，请稍后重试或降低并发/调用频率。"
+    return message
+
+
 def run_analysis_in_thread(
     ticker: str,
     trade_date: str,
@@ -117,7 +130,10 @@ def run_analysis_in_thread(
         try:
             _run(ticker, trade_date, config, tracker)
         except Exception as exc:
-            tracker.mark_error(str(exc))
+            # Keep the full traceback in the terminal while showing a concise,
+            # actionable message in Streamlit.
+            traceback.print_exc()
+            tracker.mark_error(_format_error(exc))
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()

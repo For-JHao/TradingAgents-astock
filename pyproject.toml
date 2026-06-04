@@ -34,6 +34,8 @@ dependencies = [
     "typing-extensions>=4.14.0",
     "yfinance>=0.2.63",
     "streamlit>=1.45.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
     "fpdf2>=2.8.0",
     "python-dotenv>=1.1.0",
     "mootdx>=0.10.0",
@@ -51,9 +53,10 @@ google = ["langchain-google-genai>=4.0.0"]
 [project.scripts]
 tradingagents = "cli.main:app"
 tradingagents-web = "web.launch:main"
+tradingagents-research-api = "research_api.app:main"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*", "web*"]
+include = ["tradingagents*", "cli*", "web*", "research_api*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
