@@ -208,8 +208,8 @@ if viewing_history:
     try:
         state = load_analysis(viewing_history)
         signal = extract_signal(state)
-        ticker = Path(viewing_history).parent.parent.name
-        trade_date = Path(viewing_history).stem.replace("full_states_log_", "")
+        ticker = state.get("company_of_interest") or Path(viewing_history).parent.parent.name
+        trade_date = state.get("trade_date", "")
         render_report(state, ticker, trade_date, signal)
     except Exception as exc:
         st.error(f"加载失败: {exc}")

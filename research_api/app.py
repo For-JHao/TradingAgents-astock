@@ -308,22 +308,13 @@ def _resolve_request_ticker(user_input: str) -> str:
         ) from exc
 
 
-def _report_path(config: dict[str, Any], ticker: str, trade_date: str) -> str:
-    return str(
-        Path(config["results_dir"])
-        / ticker
-        / "TradingAgentsStrategy_logs"
-        / f"full_states_log_{trade_date}.json"
-    )
-
-
 def _summarize_state(
     final_state: dict[str, Any],
     *,
     ticker: str,
     trade_date: str,
     signal: str,
-    config: dict[str, Any],
+    report_path: str | None = None,
 ) -> dict[str, Any]:
     final_decision = str(final_state.get("final_trade_decision", ""))
     return {
@@ -342,7 +333,7 @@ def _summarize_state(
             "investment_plan": final_state.get("investment_plan", ""),
             "trader_investment_plan": final_state.get("trader_investment_plan", ""),
         },
-        "report_path": _report_path(config, ticker, trade_date),
+        "report_path": report_path or "",
     }
 
 
@@ -364,7 +355,7 @@ def _run_job(job_id: str) -> None:
             ticker=job.ticker,
             trade_date=job.trade_date,
             signal=signal,
-            config=job.config,
+            report_path=str(graph.last_log_path) if graph.last_log_path else None,
         )
         with _lock:
             job.status = "succeeded"

@@ -55,6 +55,12 @@ from .reflection import Reflector
 from .signal_processing import SignalProcessor
 
 
+def states_log_filename(trade_date: str, ts: datetime | None = None) -> str:
+    """Build a unique on-disk log filename for one analysis run."""
+    ts = ts or datetime.now()
+    return f"full_states_log_{trade_date}_{ts.strftime('%H%M%S')}.json"
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -132,6 +138,7 @@ class TradingAgentsGraph:
         self.curr_state = None
         self.ticker = None
         self.log_states_dict = {}  # date to full state dict
+        self.last_log_path: Path | None = None
 
         # Set up the graph: keep the workflow for recompilation with a checkpointer.
         self.workflow = self.graph_setup.setup_graph(selected_analysts)
@@ -424,9 +431,10 @@ class TradingAgentsGraph:
         directory = Path(self.config["results_dir"]) / safe_ticker / "TradingAgentsStrategy_logs"
         directory.mkdir(parents=True, exist_ok=True)
 
-        log_path = directory / f"full_states_log_{trade_date}.json"
+        log_path = directory / states_log_filename(str(trade_date))
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(self.log_states_dict[str(trade_date)], f, indent=4)
+        self.last_log_path = log_path
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""

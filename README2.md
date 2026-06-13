@@ -1,4 +1,7 @@
-启动方式：
+需要先安装：
+pip install -e .
+
+两种独立启动方式：
 1. Web UI，适合直接在web页面手动发起特定投研
 tradingagents-web
 
