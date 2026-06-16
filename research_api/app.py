@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from tradingagents.dataflows.a_stock import resolve_ticker
+from tradingagents.dataflows.a_stock import resolve_ticker, _tencent_quote
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -98,6 +98,28 @@ class StockCandidate(BaseModel):
 class StockSearchResponse(BaseModel):
     keyword: str
     candidates: list[StockCandidate]
+
+
+class MarketQuotesRequest(BaseModel):
+    codes: list[str] = Field(default_factory=list, description="A-share 6-digit code list")
+
+
+class MarketQuoteItem(BaseModel):
+    code: str
+    name: str | None = None
+    price: float
+    last_close: float | None = None
+    open: float | None = None
+    change_pct: float | None = None
+    high: float | None = None
+    low: float | None = None
+    volume: float | None = None
+    turnover_pct: float | None = None
+    ts: float
+
+
+class MarketQuotesResponse(BaseModel):
+    quotes: list[MarketQuoteItem]
 
 
 class _Job:
@@ -308,6 +330,18 @@ def _resolve_request_ticker(user_input: str) -> str:
         ) from exc
 
 
+def _normalize_market_code(raw: str) -> str:
+    code = raw.strip().upper()
+    match = _TICKER_RE.fullmatch(code)
+    if match:
+        return match.group(1)
+    if _HAS_CHINESE_RE.search(code):
+        return _resolve_request_ticker(code)
+    if _re.fullmatch(r"\d{6}", code):
+        return code
+    raise HTTPException(status_code=400, detail=f"无效股票代码: {raw}")
+
+
 def _summarize_state(
     final_state: dict[str, Any],
     *,
@@ -397,6 +431,52 @@ def search_stocks(keyword: str) -> dict[str, Any]:
         "keyword": keyword,
         "candidates": [item.model_dump() for item in candidates[:10]],
     }
+
+
+@app.post("/market/quotes", response_model=MarketQuotesResponse)
+def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
+    if not request.codes:
+        raise HTTPException(status_code=400, detail="codes 不能为空")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in request.codes:
+        code = _normalize_market_code(raw)
+        if code in seen:
+            continue
+        seen.add(code)
+        normalized.append(code)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="codes 无有效项")
+
+    try:
+        quote_map = _tencent_quote(normalized)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"行情源请求失败: {exc}") from exc
+
+    now_ts = time.time()
+    quotes: list[dict[str, Any]] = []
+    for code in normalized:
+        item = quote_map.get(code)
+        if not item:
+            continue
+        quotes.append(
+            {
+                "code": code,
+                "name": item.get("name"),
+                "price": float(item.get("price") or 0),
+                "last_close": float(item.get("last_close") or 0),
+                "open": float(item.get("open") or 0),
+                "change_pct": float(item.get("change_pct") or 0),
+                "high": float(item.get("high") or 0),
+                "low": float(item.get("low") or 0),
+                "volume": None,
+                "turnover_pct": float(item.get("turnover_pct") or 0),
+                "ts": now_ts,
+            }
+        )
+
+    return {"quotes": quotes}
 
 
 @app.post("/research/jobs", response_model=ResearchJobCreated)
