@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from tradingagents.dataflows.a_stock import resolve_ticker, _tencent_quote
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from research_api.job_store import ResearchJobStore
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -163,10 +164,38 @@ class _Job:
             data["result"] = self.result
         return data
 
+    def persistence_record(self) -> dict[str, Any]:
+        return {
+            **self.snapshot(include_result=True),
+            "request": self.request.model_dump(mode="json"),
+            "config": self.config,
+            "selected_analysts": self.selected_analysts,
+        }
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "_Job":
+        request = ResearchJobRequest.model_validate(record["request"])
+        job = cls(
+            job_id=str(record["job_id"]),
+            request=request,
+            ticker=str(record["ticker"]),
+            trade_date=str(record["trade_date"]),
+            config=dict(record["config"]),
+            selected_analysts=list(record["selected_analysts"]),
+        )
+        job.status = str(record["status"])
+        job.created_at = float(record["created_at"])
+        job.updated_at = float(record["updated_at"])
+        job.error = record.get("error")
+        job.signal = record.get("signal")
+        job.result = record.get("result")
+        return job
+
 
 app = FastAPI(title="TradingAgents-Astock Research API", version="0.1.0")
 _jobs: dict[str, _Job] = {}
 _lock = threading.Lock()
+_job_store = ResearchJobStore()
 _HAS_CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _TICKER_RE = re.compile(r"^(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
 
@@ -376,6 +405,7 @@ def _run_job(job_id: str) -> None:
         job = _jobs[job_id]
         job.status = "running"
         job.updated_at = time.time()
+        _job_store.save(job.persistence_record())
 
     try:
         graph = TradingAgentsGraph(
@@ -396,11 +426,31 @@ def _run_job(job_id: str) -> None:
             job.signal = signal
             job.result = result
             job.updated_at = time.time()
+            _job_store.save(job.persistence_record())
     except Exception as exc:
         with _lock:
             job.status = "failed"
             job.error = str(exc)
             job.updated_at = time.time()
+            _job_store.save(job.persistence_record())
+
+
+def _restore_jobs() -> None:
+    for record in _job_store.load_all():
+        try:
+            job = _Job.from_record(record)
+        except Exception as exc:
+            print(f"[research-api] skip invalid persisted job: {exc}")
+            continue
+        if job.status in {"queued", "running"}:
+            job.status = "failed"
+            job.error = "投研服务曾重启，原任务执行状态无法安全续跑，请重新提交"
+            job.updated_at = time.time()
+            _job_store.save(job.persistence_record())
+        _jobs[job.job_id] = job
+
+
+_restore_jobs()
 
 
 @app.get("/health")
@@ -409,6 +459,7 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "service": "tradingagents-astock-research-api",
         "jobs": len(_jobs),
+        "database": _job_store.health(),
     }
 
 
@@ -497,6 +548,7 @@ def create_research_job(request: ResearchJobRequest) -> dict[str, Any]:
 
     with _lock:
         _jobs[job_id] = job
+        _job_store.save(job.persistence_record())
 
     thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
     thread.start()

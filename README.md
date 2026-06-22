@@ -336,6 +336,13 @@ TradingAgents-Astock/
 
 ---
 
+## Research API 持久化
+
+`tradingagents-research-api` 使用 SQLite WAL 保存任务状态，默认数据库位于
+`~/.tradingagents/research-api/jobs.db`，可通过 `ASTOCK_RESEARCH_DB_PATH` 修改。服务重启后，
+已完成任务仍可查询；重启时正在排队或运行的任务会安全地标记为失败，需要客户端重新提交，
+避免重复执行 Agent 工作流。
+
 ## 致谢
 
 本项目基于 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 开源项目进行 A 股特化改造。感谢原作者的出色工作和 Apache 2.0 开源精神。
