@@ -13,13 +13,14 @@ from typing import Any, Literal
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from tradingagents.dataflows.a_stock import resolve_ticker, _tencent_quote
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from research_api.job_store import ResearchJobStore
+from research_api.service_status import ApiMetrics
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -193,11 +194,34 @@ class _Job:
 
 
 app = FastAPI(title="TradingAgents-Astock Research API", version="0.1.0")
+_api_metrics = ApiMetrics()
 _jobs: dict[str, _Job] = {}
 _lock = threading.Lock()
 _job_store = ResearchJobStore()
 _HAS_CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _TICKER_RE = re.compile(r"^(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
+
+
+@app.middleware("http")
+async def observe_api_requests(request: Request, call_next):
+    started_at = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    except Exception:
+        status_code = 500
+        raise
+    finally:
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", request.url.path)
+        _api_metrics.record(request.method, route_path, status_code, duration_ms)
+        if status_code >= 400:
+            print(
+                f"[research-api] {request.method} {route_path} "
+                f"{status_code} {duration_ms:.1f}ms"
+            )
+    return response
 
 
 def _choose_provider(request_provider: str | None) -> str:
@@ -463,6 +487,18 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.get("/status")
+def service_status() -> dict[str, Any]:
+    routes: list[tuple[str, str]] = []
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if not path or not methods or not getattr(route, "include_in_schema", False):
+            continue
+        routes.extend((method, path) for method in methods if method not in {"HEAD", "OPTIONS"})
+    return {"health": health(), "endpoints": _api_metrics.snapshot(routes)}
+
+
 @app.get("/research/search", response_model=StockSearchResponse)
 def search_stocks(keyword: str) -> dict[str, Any]:
     raw = keyword.strip()
@@ -584,7 +620,14 @@ def main() -> None:
 
     host = os.getenv("ASTOCK_RESEARCH_API_HOST", "127.0.0.1")
     port = int(os.getenv("ASTOCK_RESEARCH_API_PORT", "8008"))
-    uvicorn.run("research_api.app:app", host=host, port=port, reload=False)
+    access_log = os.getenv("ASTOCK_HTTP_ACCESS_LOG", "0").lower() in {"1", "true", "yes"}
+    uvicorn.run(
+        "research_api.app:app",
+        host=host,
+        port=port,
+        reload=False,
+        access_log=access_log,
+    )
 
 
 if __name__ == "__main__":

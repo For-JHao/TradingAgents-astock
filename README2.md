@@ -11,14 +11,12 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-mac以后每次重新打开终端，都需要先进入项目并激活虚拟环境：
-source .venv/bin/activate
-
+mac以后每次重新打开终端，都需要先进入项目目录。
 
 # 两种独立启动方式：
 1. Web UI，适合直接在web页面手动发起特定投研
-tradingagents-web
+source .venv/bin/activate && tradingagents-web
 
-2. 启动api服务，共其他项目以 RESTful API 方式调用astock投研
-tradingagents-research-api
+2. 启动api服务，供其他项目以 RESTful API 方式调用astock投研（快捷启动，自动使用虚拟环境）
+./scripts/start-research-api.sh
 

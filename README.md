@@ -343,6 +343,15 @@ TradingAgents-Astock/
 已完成任务仍可查询；重启时正在排队或运行的任务会安全地标记为失败，需要客户端重新提交，
 避免重复执行 Agent 工作流。
 
+默认不逐条打印 HTTP 200 访问日志，HTTP 异常仍会输出。需要临时查看两个服务及 Research API
+全部接口的最近状态时运行：
+
+```bash
+tradingagents-research-status
+```
+
+排障时设置 `ASTOCK_HTTP_ACCESS_LOG=1` 并重启服务，可恢复 Uvicorn 完整访问日志。
+
 ## 致谢
 
 本项目基于 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 开源项目进行 A 股特化改造。感谢原作者的出色工作和 Apache 2.0 开源精神。

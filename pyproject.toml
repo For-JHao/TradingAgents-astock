@@ -54,6 +54,7 @@ google = ["langchain-google-genai>=4.0.0"]
 tradingagents = "cli.main:app"
 tradingagents-web = "web.launch:main"
 tradingagents-research-api = "research_api.app:main"
+tradingagents-research-status = "research_api.status_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["tradingagents*", "cli*", "web*", "research_api*"]
