@@ -98,7 +98,8 @@ class GraphSetup:
             delete_nodes["lockup"] = create_msg_delete()
             tool_nodes["lockup"] = self.tool_nodes["lockup"]
 
-        # Create quality gate node
+        # Create ETF data guard + quality gate nodes
+        etf_data_guard_node = create_etf_data_guard()
         quality_gate_node = create_quality_gate(self.quick_thinking_llm)
 
         # Create researcher and manager nodes
@@ -124,7 +125,8 @@ class GraphSetup:
             )
             workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
 
-        # Add quality gate + other nodes
+        # Add ETF data guard + quality gate + other nodes
+        workflow.add_node("ETF Data Guard", etf_data_guard_node)
         workflow.add_node("Quality Gate", quality_gate_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
@@ -159,8 +161,9 @@ class GraphSetup:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Quality Gate")
+                workflow.add_edge(current_clear, "ETF Data Guard")
 
+        workflow.add_edge("ETF Data Guard", "Quality Gate")
         workflow.add_edge("Quality Gate", "Bull Researcher")
 
         # Add remaining edges

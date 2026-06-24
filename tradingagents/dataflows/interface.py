@@ -28,6 +28,7 @@ from .a_stock import (
     get_stock_data as get_astock_stock_data,
     get_indicators as get_astock_indicators,
     get_fundamentals as get_astock_fundamentals,
+    get_etf_profile as get_astock_etf_profile,
     get_balance_sheet as get_astock_balance_sheet,
     get_cashflow as get_astock_cashflow,
     get_income_statement as get_astock_income_statement,
@@ -62,9 +63,10 @@ TOOLS_CATEGORIES = {
         ]
     },
     "fundamental_data": {
-        "description": "Company fundamentals",
+        "description": "Company fundamentals and ETF profile data",
         "tools": [
             "get_fundamentals",
+            "get_etf_profile",
             "get_balance_sheet",
             "get_cashflow",
             "get_income_statement"
@@ -118,6 +120,9 @@ VENDOR_METHODS = {
         "a_stock": get_astock_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
+    },
+    "get_etf_profile": {
+        "a_stock": get_astock_etf_profile,
     },
     "get_balance_sheet": {
         "a_stock": get_astock_balance_sheet,

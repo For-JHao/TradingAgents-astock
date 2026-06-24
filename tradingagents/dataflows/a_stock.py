@@ -1,12 +1,13 @@
 """A-stock (China mainland) data vendor for TradingAgents.
 
-Zero third-party data dependency (no akshare). All sources are direct HTTP APIs
-or mootdx TCP.
+Most sources are direct HTTP APIs or mootdx TCP. AKShare is used only as an
+optional ETF/listed-fund enrichment source when installed.
 
 Data sources:
 - mootdx (TCP 7709): OHLCV K-lines, financial snapshots, F10 text
 - Tencent Finance (HTTP GBK): PE/PB/market cap/turnover
 - 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup
+- 东方财富 push2his (direct HTTP): ETF/stock historical K-lines fallback
 - 新浪财经 (direct HTTP): K-line fallback, financial statements
 - 同花顺 (direct HTTP): consensus EPS, hot stocks, northbound capital flow
 - 财联社 (direct HTTP): global news wire
@@ -26,6 +27,8 @@ import re as _re
 import time
 import uuid
 import urllib.request
+import contextlib
+import io
 
 import pandas as pd
 import requests as _requests
@@ -41,11 +44,21 @@ logger = logging.getLogger(__name__)
 
 def _get_prefix(code: str) -> str:
     """6-digit A-stock code -> market prefix for Tencent API."""
-    if code.startswith(("6", "9")):
+    if code.startswith(("5", "6", "9")):
         return "sh"
     elif code.startswith("8"):
         return "bj"
     return "sz"
+
+
+def _eastmoney_market_id(code: str) -> int:
+    """6-digit security code -> Eastmoney secid market id."""
+    return 1 if code.startswith(("5", "6", "9")) else 0
+
+
+def _is_etf_like_code(code: str) -> bool:
+    """Best-effort A-share listed fund/ETF code detection."""
+    return code.startswith(("1", "5"))
 
 
 def _normalize_ticker(symbol: str) -> str:
@@ -94,7 +107,7 @@ def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
         for _, row in stocks.iterrows():
             code = str(row["code"]).strip()
             name = str(row["name"]).strip()
-            if not _re.match(r"^[036]\d{5}$", code):
+            if not _re.match(r"^[01356]\d{5}$", code):
                 continue
             clean_name = name.replace(" ", "").replace("　", "")
             n2c[clean_name] = code
@@ -224,6 +237,60 @@ _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
 
 
+# ETF enrichment caches. Multi-agent research can ask for the same ETF profile
+# from several analysts; without caching, AKShare's full ETF list endpoint is
+# repeatedly hit and may return 429/rate-limit errors.
+_VERIFIED_ETF_NAMES = {
+    "562060": "标普A股红利ETF华宝",
+}
+_ETF_NAME_CACHE: dict[str, str] = {}
+_ETF_PROFILE_CACHE: dict[tuple[str, str], str] = {}
+_AK_ETF_SPOT_DF_CACHE: dict[str, object] = {"ts": 0.0, "df": None}
+_AK_ETF_KLINE_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
+_AK_ETF_SPOT_TTL_SECONDS = float(os.environ.get("AK_ETF_SPOT_TTL_SECONDS", "3600"))
+_AK_ETF_SPOT_BACKOFF_SECONDS = float(
+    os.environ.get("AK_ETF_SPOT_BACKOFF_SECONDS", "1800")
+)
+_AK_ETF_SPOT_BACKOFF_UNTIL = [0.0]
+
+
+def _is_rate_limited_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("429", "too many requests", "rate limit", "rate-limited", "rate limited")
+    )
+
+
+def _brief_http_error(exc: Exception) -> str:
+    text = str(exc)
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+def _response_json_or_empty(resp: _requests.Response) -> dict:
+    """Parse JSON defensively for public endpoints that sometimes return HTML."""
+    try:
+        resp.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"HTTP {resp.status_code}: {_brief_http_error(exc)}") from exc
+
+    text = resp.text.strip()
+    if not text:
+        raise RuntimeError(f"empty response, content-type={resp.headers.get('content-type', '')}")
+    content_type = resp.headers.get("content-type", "").lower()
+    if "json" not in content_type and not text.startswith(("{", "[")):
+        preview = text[:80].replace("\n", " ")
+        raise RuntimeError(
+            f"non-JSON response, status={resp.status_code}, "
+            f"content-type={content_type}, preview={preview!r}"
+        )
+    try:
+        return resp.json()
+    except ValueError as exc:
+        preview = text[:80].replace("\n", " ")
+        raise RuntimeError(f"invalid JSON response, preview={preview!r}") from exc
+
+
 def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     """东财统一请求入口：自动节流 + 复用 session + 默认 UA。
 
@@ -306,7 +373,7 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
 
     Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
-    prefix = "sh" if code.startswith("6") else "sz"
+    prefix = _get_prefix(code)
     url = (
         "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
         "CN_MarketData.getKLineData"
@@ -346,6 +413,613 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
     return df
 
 
+def _eastmoney_kline_fallback(
+    code: str, start_date: str = None, end_date: str = None
+) -> pd.DataFrame:
+    """Fetch daily K-line from Eastmoney push2his.
+
+    This endpoint covers both A-shares and listed funds/ETFs, so it is a better
+    fallback for 5xxxxx/1xxxxx ETF codes than mootdx or Sina.
+    """
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": f"{_eastmoney_market_id(code)}.{code}",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "1",
+        "beg": (start_date or "19900101").replace("-", ""),
+        "end": (end_date or "20500101").replace("-", ""),
+    }
+    r = _em_get(url, params=params, timeout=15)
+    r.raise_for_status()
+    klines = (r.json().get("data") or {}).get("klines") or []
+    if not klines:
+        return pd.DataFrame()
+
+    rows = []
+    for line in klines:
+        parts = str(line).split(",")
+        if len(parts) < 6:
+            continue
+        rows.append(
+            {
+                "Date": parts[0],
+                "Open": float(parts[1]),
+                "Close": float(parts[2]),
+                "High": float(parts[3]),
+                "Low": float(parts[4]),
+                "Volume": int(float(parts[5])),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df
+
+
+def _eastmoney_security_snapshot(code: str) -> dict:
+    """Fetch a broad Eastmoney quote snapshot for stocks and listed funds."""
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "fltt": "2",
+        "invt": "2",
+        "fields": ",".join(
+            [
+                "f43",  # latest price
+                "f44",  # high
+                "f45",  # low
+                "f46",  # open
+                "f47",  # volume
+                "f48",  # amount
+                "f57",  # code
+                "f58",  # name
+                "f60",  # previous close
+                "f116",  # total market cap / fund market value where available
+                "f117",  # float market cap
+                "f127",  # industry/category
+                "f168",  # turnover rate
+                "f169",  # change
+                "f170",  # change pct
+            ]
+        ),
+        "secid": f"{_eastmoney_market_id(code)}.{code}",
+    }
+    r = _em_get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json().get("data") or {}
+
+
+def _extract_js_var(text: str, name: str) -> str | None:
+    match = _re.search(rf"var\s+{_re.escape(name)}\s*=\s*(.*?);", text, _re.S)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _parse_js_json_var(text: str, name: str, default=None):
+    raw = _extract_js_var(text, name)
+    if raw is None:
+        return default
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return default
+
+
+def _parse_js_string_var(text: str, name: str) -> str:
+    raw = _extract_js_var(text, name)
+    if raw is None:
+        return ""
+    try:
+        value = _json.loads(raw)
+        return "" if value is None else str(value)
+    except Exception:
+        return raw.strip().strip('"').strip("'")
+
+
+def _eastmoney_fund_script(code: str) -> str:
+    """Fetch Eastmoney fund profile script for ETF/open fund metadata."""
+    url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js"
+    headers = {
+        "User-Agent": _UA,
+        "Referer": "https://fund.eastmoney.com/",
+    }
+    r = _requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+
+def _akshare_etf_spot(code: str) -> dict:
+    """Fetch ETF spot row from AKShare when the optional dependency is available."""
+    now = time.time()
+    if now < _AK_ETF_SPOT_BACKOFF_UNTIL[0]:
+        wait_left = int(_AK_ETF_SPOT_BACKOFF_UNTIL[0] - now)
+        raise RuntimeError(f"AKShare ETF spot is cooling down after rate limit ({wait_left}s left)")
+
+    try:
+        import akshare as ak
+    except Exception as exc:
+        raise RuntimeError("AKShare is not installed") from exc
+
+    cached_df = _AK_ETF_SPOT_DF_CACHE.get("df")
+    cached_ts = float(_AK_ETF_SPOT_DF_CACHE.get("ts") or 0.0)
+    if isinstance(cached_df, pd.DataFrame) and now - cached_ts < _AK_ETF_SPOT_TTL_SECONDS:
+        df = cached_df
+    else:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                df = ak.fund_etf_spot_em()
+        except Exception as exc:
+            if _is_rate_limited_error(exc):
+                _AK_ETF_SPOT_BACKOFF_UNTIL[0] = time.time() + _AK_ETF_SPOT_BACKOFF_SECONDS
+            raise
+        _AK_ETF_SPOT_DF_CACHE["df"] = df
+        _AK_ETF_SPOT_DF_CACHE["ts"] = time.time()
+
+    if df is None or df.empty:
+        return {}
+    code_col = "代码" if "代码" in df.columns else None
+    if not code_col:
+        return {}
+    matched = df[df[code_col].astype(str).str.zfill(6) == code]
+    if matched.empty:
+        return {}
+    row = matched.iloc[0].to_dict()
+    return {str(k): v for k, v in row.items()}
+
+
+def _akshare_etf_kline(
+    code: str, start_date: str = None, end_date: str = None
+) -> pd.DataFrame:
+    """Fetch ETF daily K-line through AKShare fund_etf_hist_em."""
+    cache_key = (
+        code,
+        start_date or "1990-01-01",
+        end_date or "2050-01-01",
+    )
+    cached = _AK_ETF_KLINE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    try:
+        import akshare as ak
+    except Exception as exc:
+        raise RuntimeError("AKShare is not installed") from exc
+
+    try:
+        df = ak.fund_etf_hist_em(
+            symbol=code,
+            period="daily",
+            start_date=(start_date or "1990-01-01").replace("-", ""),
+            end_date=(end_date or "2050-01-01").replace("-", ""),
+            adjust="qfq",
+        )
+    except Exception as exc:
+        if _is_rate_limited_error(exc):
+            _AK_ETF_SPOT_BACKOFF_UNTIL[0] = time.time() + _AK_ETF_SPOT_BACKOFF_SECONDS
+        raise
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    rename_candidates = {
+        "日期": "Date",
+        "开盘": "Open",
+        "收盘": "Close",
+        "最高": "High",
+        "最低": "Low",
+        "成交量": "Volume",
+        "成交额": "Amount",
+    }
+    df = df.rename(columns={k: v for k, v in rename_candidates.items() if k in df.columns})
+    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    if not all(col in df.columns for col in required):
+        return pd.DataFrame()
+    df = df[required]
+    df["Date"] = pd.to_datetime(df["Date"])
+    for col in ["Open", "High", "Low", "Close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
+    result = df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+    _AK_ETF_KLINE_CACHE[cache_key] = result.copy()
+    return result
+
+
+def get_etf_verified_name(code: str) -> str:
+    """Return verified ETF/listed fund name from trusted public sources."""
+    normalized = _normalize_ticker(code)
+    if not _is_etf_like_code(normalized):
+        return ""
+    if normalized in _ETF_NAME_CACHE:
+        return _ETF_NAME_CACHE[normalized]
+    if normalized in _VERIFIED_ETF_NAMES:
+        _ETF_NAME_CACHE[normalized] = _VERIFIED_ETF_NAMES[normalized]
+        return _ETF_NAME_CACHE[normalized]
+
+    try:
+        row = _akshare_etf_spot(normalized)
+        name = str(row.get("名称") or "").strip()
+        if name:
+            _ETF_NAME_CACHE[normalized] = name
+            return name
+    except Exception as e:
+        logger.warning("AKShare ETF name failed for %s: %s", normalized, e)
+    try:
+        name = _parse_js_string_var(_eastmoney_fund_script(normalized), "fS_name")
+        if name:
+            _ETF_NAME_CACHE[normalized] = name
+            return name
+    except Exception as e:
+        logger.warning("eastmoney ETF fund name failed for %s: %s", normalized, e)
+    try:
+        snapshot = _eastmoney_security_snapshot(normalized)
+        name = str(snapshot.get("f58") or "")
+        if name:
+            _ETF_NAME_CACHE[normalized] = name
+        return name
+    except Exception:
+        return ""
+
+
+def _format_latest_net_worth(items: list[dict]) -> list[str]:
+    if not items:
+        return []
+    latest = items[-1]
+    lines = ["--- Net Value / Price Proxy Trend (Eastmoney fund page) ---"]
+    timestamp = latest.get("x")
+    if timestamp:
+        try:
+            date_text = datetime.fromtimestamp(int(timestamp) / 1000).strftime("%Y-%m-%d")
+        except Exception:
+            date_text = str(timestamp)
+        lines.append(f"Latest NAV Date: {date_text}")
+    for key, label in {
+        "y": "Latest Unit NAV",
+        "equityReturn": "Daily NAV Return (%)",
+        "unitMoney": "Distribution per Unit",
+    }.items():
+        value = latest.get(key)
+        if value not in (None, "", "-"):
+            lines.append(f"{label}: {value}")
+    if len(items) >= 20:
+        try:
+            first = float(items[-20].get("y"))
+            last = float(items[-1].get("y"))
+            if first:
+                lines.append(f"20-point NAV Return: {(last / first - 1) * 100:.2f}%")
+        except Exception:
+            pass
+    return lines
+
+
+def _format_asset_allocation(items) -> list[str]:
+    if not items:
+        return []
+    lines = ["--- Asset Allocation ---"]
+    if isinstance(items, dict) and isinstance(items.get("series"), list):
+        categories = items.get("categories") or []
+        if categories:
+            lines.append(f"Allocation Date: {categories[-1]}")
+        for series in items["series"]:
+            if not isinstance(series, dict):
+                continue
+            name = series.get("name")
+            data = series.get("data") or []
+            if name and data:
+                lines.append(f"{name}: {data[-1]}")
+        return lines
+    latest = items[-1] if isinstance(items, list) else items
+    if isinstance(latest, dict):
+        date_text = latest.get("date") or latest.get("x") or latest.get("FSRQ")
+        if date_text:
+            lines.append(f"Allocation Date: {date_text}")
+        for key, label in {
+            "gp": "Stock Position (%)",
+            "zq": "Bond Position (%)",
+            "xj": "Cash Position (%)",
+            "jz": "Net Asset Value",
+        }.items():
+            value = latest.get(key)
+            if value not in (None, "", "-"):
+                lines.append(f"{label}: {value}")
+    return lines
+
+
+def _format_top_holdings(script_text: str) -> list[str]:
+    holdings = _parse_js_json_var(script_text, "stockCodesNew", []) or []
+    if not holdings:
+        holdings = _parse_js_json_var(script_text, "stockCodes", []) or []
+    if not holdings:
+        return []
+    codes = []
+    for item in holdings[:10]:
+        raw = str(item)
+        code = raw.split(".")[-1][-6:]
+        if _re.fullmatch(r"\d{6}", code):
+            codes.append(code)
+    if not codes:
+        return []
+
+    names = {}
+    try:
+        quotes = _tencent_quote(codes)
+        names = {code: data.get("name") for code, data in quotes.items()}
+    except Exception as e:
+        logger.warning("ETF holding names failed: %s", e)
+
+    lines = ["--- Top Holding Codes (latest public fund page) ---"]
+    for idx, code in enumerate(codes, start=1):
+        name = names.get(code)
+        lines.append(f"{idx}. {code}" + (f" {name}" if name else ""))
+    return lines
+
+
+def get_etf_profile(
+    ticker: Annotated[str, "ETF/listed fund code"],
+    curr_date: Annotated[str, "current date"] = None,
+) -> str:
+    """Get ETF-specific profile, NAV trend, holdings, scale and liquidity data."""
+    code = _normalize_ticker(ticker)
+    if not _is_etf_like_code(code):
+        return f"{code} is not detected as a listed ETF/fund code."
+
+    profile_date = curr_date or datetime.now().strftime("%Y-%m-%d")
+    profile_key = (code, profile_date)
+    if profile_key in _ETF_PROFILE_CACHE:
+        return _ETF_PROFILE_CACHE[profile_key]
+
+    lines = []
+    script_text = ""
+    akshare_name = ""
+    verified_name = _VERIFIED_ETF_NAMES.get(code) or _ETF_NAME_CACHE.get(code) or ""
+    if verified_name:
+        lines.extend(
+            [
+                f"Name: {verified_name}",
+                f"Code: {code}",
+                "Security Type: Listed ETF / fund",
+                "Identity Rule: Verified from trusted ETF metadata cache; do not infer the name from memory.",
+            ]
+        )
+
+    try:
+        spot = _akshare_etf_spot(code)
+        if spot:
+            akshare_name = str(spot.get("名称") or "").strip()
+            if akshare_name:
+                _ETF_NAME_CACHE[code] = akshare_name
+            if not any(line.startswith("Name:") for line in lines):
+                lines.extend(
+                    [
+                        f"Name: {akshare_name or code}",
+                        f"Code: {code}",
+                        "Security Type: Listed ETF / fund",
+                        "Identity Rule: Verified from AKShare fund_etf_spot_em; do not infer the name from memory.",
+                    ]
+                )
+            elif akshare_name and verified_name and akshare_name != verified_name:
+                lines.append(f"AKShare Name Cross-check: {akshare_name}")
+            lines.append("--- AKShare ETF Spot ---")
+            for key in ["最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "开盘价", "最高价", "最低价", "昨收"]:
+                value = spot.get(key)
+                if value not in (None, "", "-"):
+                    lines.append(f"AKShare {key}: {value}")
+    except Exception as e:
+        logger.warning("AKShare ETF spot failed for %s: %s", code, e)
+
+    try:
+        script_text = _eastmoney_fund_script(code)
+        name = _parse_js_string_var(script_text, "fS_name") or code
+        if not any(line.startswith("Name:") for line in lines):
+            lines.extend(
+                [
+                    f"Name: {name}",
+                    f"Code: {code}",
+                    "Security Type: Listed ETF / fund",
+                    "Identity Rule: Verified from Eastmoney fund page; do not infer the name from memory.",
+                ]
+            )
+        elif name and akshare_name and name != akshare_name:
+            lines.append(f"Eastmoney Name Cross-check: {name}")
+        for var_name, label in {
+            "syl_1y": "1-Month Return (%)",
+            "syl_3y": "3-Month Return (%)",
+            "syl_6y": "6-Month Return (%)",
+            "syl_1n": "1-Year Return (%)",
+            "fund_sourceRate": "Original Fee Rate",
+            "fund_Rate": "Current Fee Rate",
+            "fund_minsg": "Minimum Subscription",
+        }.items():
+            value = _parse_js_string_var(script_text, var_name)
+            if value:
+                lines.append(f"{label}: {value}")
+
+        lines.extend(_format_latest_net_worth(_parse_js_json_var(script_text, "Data_netWorthTrend", []) or []))
+        lines.extend(_format_asset_allocation(_parse_js_json_var(script_text, "Data_assetAllocation", []) or []))
+        lines.extend(_format_top_holdings(script_text))
+
+        scale = _parse_js_json_var(script_text, "Data_fluctuationScale", []) or []
+        if scale:
+            lines.append("--- Fund Scale / Shares ---")
+            if isinstance(scale, dict) and isinstance(scale.get("series"), list):
+                categories = scale.get("categories") or []
+                latest_index = len(categories) - 1 if categories else -1
+                if latest_index >= 0:
+                    lines.append(f"Scale Date: {categories[latest_index]}")
+                for series in scale["series"]:
+                    if not isinstance(series, dict):
+                        continue
+                    value = series.get("y")
+                    mom = series.get("mom")
+                    if value not in (None, "", "-"):
+                        suffix = f", QoQ/MoM: {mom}" if mom not in (None, "", "-") else ""
+                        lines.append(f"Scale: {value}{suffix}")
+            elif isinstance(scale, list) and scale:
+                latest_scale = scale[-1]
+                if isinstance(latest_scale, dict):
+                    for key, value in latest_scale.items():
+                        if value not in (None, "", "-"):
+                            lines.append(f"{key}: {value}")
+            elif isinstance(scale, dict):
+                for key, value in scale.items():
+                    if value not in (None, "", "-"):
+                        lines.append(f"{key}: {value}")
+
+        managers = _parse_js_json_var(script_text, "Data_currentFundManager", []) or []
+        if managers:
+            lines.append("--- Fund Manager ---")
+            for manager in managers[:3]:
+                if isinstance(manager, dict):
+                    name = manager.get("name") or manager.get("Name")
+                    work_time = manager.get("workTime") or manager.get("WorkTime")
+                    if name:
+                        lines.append(f"{name}" + (f" ({work_time})" if work_time else ""))
+    except Exception as e:
+        logger.warning("eastmoney fund page failed for %s: %s", code, e)
+
+    try:
+        snapshot = _eastmoney_security_snapshot(code)
+        if snapshot:
+            if not any(line.startswith("Name:") for line in lines):
+                lines.extend(
+                    [
+                        f"Name: {snapshot.get('f58') or code}",
+                        f"Code: {code}",
+                        "Security Type: Listed ETF / fund",
+                    ]
+                )
+            lines.append("--- Exchange Trading Snapshot ---")
+            for field, label in {
+                "f43": "Latest Price",
+                "f169": "Price Change",
+                "f170": "Price Change Percent (%)",
+                "f60": "Previous Close",
+                "f46": "Open",
+                "f44": "High",
+                "f45": "Low",
+                "f47": "Volume",
+                "f48": "Amount",
+                "f168": "Turnover Rate (%)",
+            }.items():
+                value = snapshot.get(field)
+                if value not in (None, "", "-"):
+                    lines.append(f"{label}: {value}")
+    except Exception as e:
+        logger.warning("eastmoney ETF snapshot failed for %s: %s", code, e)
+
+    try:
+        end_date = curr_date or datetime.now().strftime("%Y-%m-%d")
+        start_date = (
+            pd.to_datetime(end_date) - pd.Timedelta(days=45)
+        ).strftime("%Y-%m-%d")
+        kline, kline_source = _load_kline_with_fallbacks(code, start_date, end_date)
+        if not kline.empty:
+            recent = kline.tail(20).copy()
+            latest = recent.iloc[-1]
+            first_close = float(recent.iloc[0]["Close"])
+            latest_close = float(latest["Close"])
+            period_return = (
+                (latest_close / first_close - 1) * 100 if first_close else 0
+            )
+            lines.extend(
+                [
+                    "--- Exchange Liquidity / Momentum ---",
+                    f"K-line Source: {kline_source}",
+                    f"Latest Trading Date: {latest['Date'].strftime('%Y-%m-%d')}",
+                    f"Latest Close: {latest_close:.3f}",
+                    f"20-bar Price Return: {period_return:.2f}%",
+                    f"20-bar Average Volume: {recent['Volume'].mean():.0f}",
+                ]
+            )
+    except Exception as e:
+        logger.info("ETF recent momentum unavailable for %s: %s", code, _brief_http_error(e))
+
+    if not lines:
+        result = f"No ETF profile data found for {code}"
+        _ETF_PROFILE_CACHE[profile_key] = result
+        return result
+
+    header = f"# ETF Analysis Data for {code}\n"
+    header += "# Data source: AKShare fund_etf_spot_em/fund_etf_hist_em + eastmoney fund page/push2his\n"
+    header += (
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    result = header + "\n".join(lines)
+    _ETF_PROFILE_CACHE[profile_key] = result
+    return result
+
+
+def _get_etf_profile(code: str, curr_date: str = None) -> str:
+    """Return ETF/listed fund profile data using quote-style public endpoints."""
+    return get_etf_profile(code, curr_date)
+
+
+def _load_kline_with_fallbacks(
+    code: str, start_date: str = None, end_date: str = None
+) -> tuple[pd.DataFrame, str]:
+    """Load daily K-line from mootdx, then AKShare/Eastmoney, then Sina."""
+    try:
+        client = _get_mootdx_client()
+        df = client.bars(symbol=code, category=4, offset=800)
+
+        if df is None or df.empty:
+            raise ValueError(f"No data from mootdx for {code}")
+
+        df = df.drop(
+            columns=["datetime", "year", "month", "day", "hour", "minute"],
+            errors="ignore",
+        )
+        df = df.reset_index()
+        df = df.rename(
+            columns={
+                "datetime": "Date",
+                "open": "Open",
+                "close": "Close",
+                "high": "High",
+                "low": "Low",
+                "volume": "Volume",
+                "amount": "Amount",
+            }
+        )
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df, "mootdx (TCP)"
+    except Exception as e:
+        logger.info("mootdx K-line unavailable for %s: %s, trying HTTP fallbacks", code, _brief_http_error(e))
+
+    if _is_etf_like_code(code):
+        try:
+            df = _akshare_etf_kline(code, start_date, end_date)
+            if not df.empty:
+                return df, "AKShare fund_etf_hist_em (fallback)"
+        except Exception as e:
+            logger.info("AKShare ETF K-line unavailable for %s: %s, trying eastmoney HTTP fallback", code, _brief_http_error(e))
+
+    skip_eastmoney_kline = os.getenv("ASTOCK_SKIP_EASTMONEY_KLINE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if not skip_eastmoney_kline:
+        try:
+            df = _eastmoney_kline_fallback(code, start_date, end_date)
+            if not df.empty:
+                return df, "eastmoney push2his (fallback)"
+        except Exception as e:
+            logger.info("eastmoney K-line unavailable for %s: %s, trying sina HTTP fallback", code, _brief_http_error(e))
+
+    try:
+        df = _sina_kline_fallback(code, start_date, end_date)
+        if not df.empty:
+            return df, "sina HTTP (fallback)"
+    except Exception as e:
+        logger.warning("sina K-line failed for %s: %s", code, _brief_http_error(e))
+
+    return pd.DataFrame(), ""
+
+
 # ---------------------------------------------------------------------------
 # OHLCV loading with cache (mootdx -> CSV)
 # ---------------------------------------------------------------------------
@@ -375,38 +1049,10 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
             cutoff = pd.to_datetime(curr_date)
             return data[data["Date"] <= cutoff]
 
-    # Fetch from mootdx — 800 daily bars (~3 years of trading days)
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
-
-        if df is None or df.empty:
-            raise ValueError(f"No OHLCV data from mootdx for {code}")
-
-        # mootdx returns index named 'datetime' AND a column named 'datetime'
-        # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
-        df = df.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
-        df = df.reset_index()  # moves index 'datetime' → column 'datetime'
-        rename_map = {
-            "datetime": "Date",
-            "open": "Open",
-            "close": "Close",
-            "high": "High",
-            "low": "Low",
-            "volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-        df["Date"] = pd.to_datetime(df["Date"])
-    except Exception as e:
-        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
-        try:
-            df = _sina_kline_fallback(code)
-            if df.empty:
-                raise ValueError(f"No OHLCV data from sina for {code}")
-        except Exception:
-            raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
+    df, _ = _load_kline_with_fallbacks(code)
+    if df.empty:
+        raise ValueError(f"No OHLCV data from mootdx/eastmoney/sina for {code}")
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
 
     # Cache to disk
     df.to_csv(cache_file, index=False, encoding="utf-8")
@@ -432,43 +1078,9 @@ def get_stock_data(
     """Get OHLCV stock price data via mootdx."""
     code = _normalize_ticker(symbol)
 
-    data_source = "mootdx (TCP)"
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
-
-        if df is None or df.empty:
-            raise ValueError(f"No data from mootdx for {code}")
-
-        # Drop duplicate datetime column + extra columns before reset_index
-        df = df.drop(
-            columns=["datetime", "year", "month", "day", "hour", "minute"],
-            errors="ignore",
-        )
-        df = df.reset_index()  # index 'datetime' → column 'datetime'
-        df = df.rename(
-            columns={
-                "datetime": "Date",
-                "open": "Open",
-                "close": "Close",
-                "high": "High",
-                "low": "Low",
-                "volume": "Volume",
-                "amount": "Amount",
-            }
-        )
-        df["Date"] = pd.to_datetime(df["Date"])
-
-    except Exception as e:
-        logger.warning("mootdx K-line failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
-        try:
-            df = _sina_kline_fallback(code, start_date, end_date)
-            if df.empty:
-                return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
-            data_source = "sina HTTP (fallback)"
-        except Exception:
-            return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
+    df, data_source = _load_kline_with_fallbacks(code, start_date, end_date)
+    if df.empty:
+        return "K线数据获取失败：mootdx、东方财富和新浪备用源均不可用，请检查网络连接"
 
     # Filter by date range
     start_dt = pd.to_datetime(start_date)
@@ -588,6 +1200,8 @@ def get_fundamentals(
 ) -> str:
     """Get company fundamentals from Tencent + mootdx + Eastmoney + 同花顺."""
     code = _normalize_ticker(ticker)
+    if _is_etf_like_code(code):
+        return _get_etf_profile(code, curr_date)
 
     try:
         lines = []
@@ -1082,7 +1696,7 @@ def get_global_news(
         cls_params = {"rn": str(limit), "page": "1"}
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
         r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
-        d_cls = r_cls.json()
+        d_cls = _response_json_or_empty(r_cls)
         for item in d_cls.get("data", {}).get("roll_data", []):
             title = item.get("title", "") or item.get("brief", "")
             content = item.get("content", "") or item.get("brief", "")
@@ -1101,7 +1715,7 @@ def get_global_news(
                 "source": "CLS Wire",
             })
     except Exception as e:
-        logger.warning("CLS news fetch failed: %s", e)
+        logger.info("CLS news unavailable: %s", _brief_http_error(e))
 
     # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
     try:
@@ -1116,7 +1730,7 @@ def get_global_news(
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
         r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
-        d_em = r_em.json()
+        d_em = _response_json_or_empty(r_em)
         for item in d_em.get("data", {}).get("fastNewsList", []):
             title = item.get("title", "")
             summary = item.get("summary", "")[:200]
@@ -1128,7 +1742,7 @@ def get_global_news(
                 "source": "Eastmoney Global",
             })
     except Exception as e:
-        logger.warning("Eastmoney global news fetch failed: %s", e)
+        logger.info("Eastmoney global news unavailable: %s", _brief_http_error(e))
 
     if not all_news:
         return f"No global news found for {curr_date}"

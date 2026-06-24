@@ -31,6 +31,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
     get_indicators,
     get_fundamentals,
+    get_etf_profile,
     get_balance_sheet,
     get_cashflow,
     get_income_statement,
@@ -174,6 +175,7 @@ class TradingAgentsGraph:
                 [
                     # Core stock data tools
                     get_stock_data,
+                    get_etf_profile,
                     # Technical indicators
                     get_indicators,
                 ]
@@ -195,6 +197,7 @@ class TradingAgentsGraph:
             "fundamentals": ToolNode(
                 [
                     get_fundamentals,
+                    get_etf_profile,
                     get_balance_sheet,
                     get_cashflow,
                     get_income_statement,
@@ -211,6 +214,7 @@ class TradingAgentsGraph:
             "hot_money": ToolNode(
                 [
                     get_stock_data,
+                    get_etf_profile,
                     get_news,
                     get_insider_transactions,
                     get_hot_stocks,
@@ -226,6 +230,7 @@ class TradingAgentsGraph:
                     get_insider_transactions,
                     get_news,
                     get_fundamentals,
+                    get_etf_profile,
                     get_lockup_expiry,
                 ]
             ),

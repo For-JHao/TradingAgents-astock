@@ -1,4 +1,7 @@
 from typing import Annotated
+import re
+
+from tradingagents.dataflows.interface import route_to_vendor
 
 REPORT_FIELDS = {
     "market": "market_report",
@@ -29,6 +32,141 @@ FAILURE_MARKERS = [
     "unable to fetch",
     "工具调用失败",
 ]
+
+
+def _is_listed_fund_ticker(ticker: str) -> bool:
+    normalized = ticker.strip().upper()
+    for suffix in (".SH", ".SZ", ".BJ"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+    for prefix in ("SH", "SZ", "BJ"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+    return bool(re.fullmatch(r"[15]\d{5}", normalized))
+
+
+def _report_is_data_poor(report: str) -> bool:
+    if not report or len(report.strip()) < MIN_REPORT_LENGTH:
+        return True
+    return (
+        report.count("[数据缺失") >= 3
+        or "数据源不可用" in report
+        or "无法计算任何指标" in report
+        or "无法确定" in report
+    )
+
+
+def _extract_profile_value(profile: str, label: str) -> str:
+    pattern = re.compile(rf"^{re.escape(label)}:\s*(.+)$", re.MULTILINE)
+    match = pattern.search(profile)
+    return match.group(1).strip() if match else "N/A"
+
+
+def _build_etf_guard_report(kind: str, ticker: str, trade_date: str, profile: str) -> str:
+    name = _extract_profile_value(profile, "Name")
+    nav = _extract_profile_value(profile, "Latest Unit NAV")
+    nav_date = _extract_profile_value(profile, "Latest NAV Date")
+    one_month = _extract_profile_value(profile, "1-Month Return (%)")
+    three_month = _extract_profile_value(profile, "3-Month Return (%)")
+    six_month = _extract_profile_value(profile, "6-Month Return (%)")
+    one_year = _extract_profile_value(profile, "1-Year Return (%)")
+    stock_position = _extract_profile_value(profile, "股票占净比")
+    net_assets = _extract_profile_value(profile, "净资产")
+    latest_close = _extract_profile_value(profile, "Latest Close")
+    price_return_20 = _extract_profile_value(profile, "20-bar Price Return")
+    avg_volume_20 = _extract_profile_value(profile, "20-bar Average Volume")
+
+    if kind == "market":
+        title = "ETF 技术面与流动性分析"
+        focus = (
+            "本节由 ETF Data Guard 基于东财 ETF 数据源确定性生成，用于替代原个股技术分析中误报的"
+            "[数据缺失]。重点观察场内价格、净值走势、成交活跃度和短中期收益表现。"
+        )
+        table = [
+            "| 必采项目 | 状态 | 数据 |",
+            "|---|---|---|",
+            f"| 最新净值/日期 | 已获取 | {nav_date}，单位净值 {nav} |",
+            f"| 近 1月/3月/6月/1年收益 | 已获取 | {one_month}% / {three_month}% / {six_month}% / {one_year}% |",
+            f"| 场内最新收盘 | 已获取 | {latest_close} |",
+            f"| 20 日价格表现 | 已获取 | {price_return_20}% |",
+            f"| 20 日平均成交量 | 已获取 | {avg_volume_20} |",
+        ]
+    elif kind == "hot_money":
+        title = "ETF 资金面与持仓暴露分析"
+        focus = (
+            "ETF 不适用个股龙虎榜、内部人交易和大股东减持逻辑。本节改用场内成交、资产配置、"
+            "规模变化和前十大持仓暴露来评估资金面。"
+        )
+        table = [
+            "| 必采项目 | 状态 | 数据 |",
+            "|---|---|---|",
+            f"| 股票仓位 | 已获取 | {stock_position}% |",
+            f"| 净资产/规模线索 | 已获取 | {net_assets} |",
+            f"| 20 日平均成交量 | 已获取 | {avg_volume_20} |",
+            f"| 20 日价格表现 | 已获取 | {price_return_20}% |",
+            "| ETF 持仓暴露 | 已获取 | 见下方东财 ETF 原始数据中的 Top Holding Codes |",
+        ]
+    else:
+        title = "ETF 基金画像与基本面替代分析"
+        focus = (
+            "ETF 不应套用上市公司 PE/PB、营收、净利润、ROE、三张表或 EPS。"
+            "本节以净值表现、资产配置、规模、基金经理和持仓暴露作为基本面替代框架。"
+        )
+        table = [
+            "| 必采项目 | 状态 | 数据 |",
+            "|---|---|---|",
+            f"| 官方名称 | 已获取 | {name}（{ticker}） |",
+            f"| 净值日期/单位净值 | 已获取 | {nav_date} / {nav} |",
+            f"| 近 1月/3月/6月/1年收益 | 已获取 | {one_month}% / {three_month}% / {six_month}% / {one_year}% |",
+            f"| 股票仓位 | 已获取 | {stock_position}% |",
+            f"| 净资产/规模线索 | 已获取 | {net_assets} |",
+        ]
+
+    return (
+        f"## {title}\n\n"
+        f"**标的**：{name}（{ticker}）  \n"
+        f"**分析日期**：{trade_date}  \n"
+        f"**数据源**：东方财富基金页 + push2his\n\n"
+        f"{focus}\n\n"
+        + "\n".join(table)
+        + "\n\n### 东财 ETF 原始数据摘录\n\n"
+        + profile
+    )
+
+
+def create_etf_data_guard():
+    """Patch ETF reports with deterministic ETF data before debate/quality gate."""
+
+    def etf_data_guard_node(state) -> dict:
+        ticker = state["company_of_interest"]
+        trade_date = state["trade_date"]
+        if not _is_listed_fund_ticker(ticker):
+            return {}
+
+        try:
+            profile = route_to_vendor("get_etf_profile", ticker, trade_date)
+        except Exception as exc:
+            return {
+                "data_quality_summary": (
+                    f"ETF Data Guard 未能获取 {ticker} 的东财 ETF 数据: {type(exc).__name__}: {exc}"
+                )
+            }
+
+        updates = {}
+        for field, kind in (
+            ("market_report", "market"),
+            ("fundamentals_report", "fundamentals"),
+            ("hot_money_report", "hot_money"),
+        ):
+            current = state.get(field, "")
+            guard_report = _build_etf_guard_report(kind, ticker, trade_date, profile)
+            if _report_is_data_poor(current):
+                updates[field] = guard_report
+            elif "东财 ETF 原始数据摘录" not in current:
+                updates[field] = current + "\n\n---\n\n" + guard_report
+        return updates
+
+    return etf_data_guard_node
 
 
 def _hard_check_report(analyst_type: str, report: str) -> tuple:

@@ -2,6 +2,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_indicators,
+    get_etf_profile,
     get_language_instruction,
     get_stock_data,
 )
@@ -17,6 +18,7 @@ def create_market_analyst(llm):
         tools = [
             get_stock_data,
             get_indicators,
+            get_etf_profile,
         ]
 
         system_message = (
@@ -64,7 +66,12 @@ MACD 类：
 2. 近 30 日累计涨跌幅
 3. 近 5 日平均成交量 vs 近 20 日平均成交量（判断放量/缩量）
 4. 至少 3 个技术指标的当前数值和多空信号
-5. 关键支撑位和阻力位"""
+5. 关键支撑位和阻力位
+
+📌 ETF/上市基金特别规则：
+- 如果标的是 1/5 开头的 6 位代码（如 562060、159915、510300），必须先调用 `get_etf_profile` 校验基金名称，报告中使用工具返回的 verified name，禁止凭记忆改写名称。
+- ETF 技术面除价格趋势外，还必须结合场内成交量/成交额、20 日均量、近 1月/3月/6月/1年收益、净值走势或溢折价线索。
+- 对 ETF 不适用的个股概念（涨跌停连板、公司业绩、股东减持）只能标注为“不适用/弱相关”，不得作为核心结论。"""
             + get_language_instruction()
         )
 

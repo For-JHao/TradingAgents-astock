@@ -9,6 +9,7 @@ from tradingagents.agents.utils.technical_indicators_tools import (
 )
 from tradingagents.agents.utils.fundamental_data_tools import (
     get_fundamentals,
+    get_etf_profile,
     get_balance_sheet,
     get_cashflow,
     get_income_statement
@@ -46,11 +47,35 @@ def get_language_instruction() -> str:
 
 def build_instrument_context(ticker: str) -> str:
     """Describe the exact instrument so agents preserve exchange-qualified tickers."""
-    return (
+    base = (
         f"The instrument to analyze is `{ticker}`. "
         "Use this exact ticker in every tool call, report, and recommendation, "
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`)."
     )
+    normalized = ticker.strip().upper()
+    for suffix in (".SH", ".SZ", ".BJ"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+    for prefix in ("SH", "SZ", "BJ"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+    if len(normalized) == 6 and normalized.isdigit() and normalized.startswith(("1", "5")):
+        verified_name = ""
+        try:
+            from tradingagents.dataflows.a_stock import get_etf_verified_name
+
+            verified_name = get_etf_verified_name(normalized)
+        except Exception:
+            verified_name = ""
+        etf_context = (
+            " This instrument is detected as a Chinese listed ETF/fund code. "
+            "Do not infer its name from memory or from unrelated search results; "
+            "call get_etf_profile and use the verified name returned by the data source."
+        )
+        if verified_name:
+            etf_context += f" Verified Eastmoney name: `{verified_name}`."
+        return base + etf_context
+    return base
 
 def create_msg_delete():
     def delete_messages(state):

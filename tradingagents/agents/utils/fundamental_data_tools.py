@@ -21,6 +21,19 @@ def get_fundamentals(
 
 
 @tool
+def get_etf_profile(
+    ticker: Annotated[str, "6-digit ETF/listed fund code, e.g. 562060 or 159915. Must be numeric, NOT fund name"],
+    curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"],
+) -> str:
+    """
+    Retrieve ETF-specific profile data: verified fund name, NAV trend, returns,
+    top holding codes, asset allocation, fund scale/manager where available,
+    and exchange trading liquidity.
+    """
+    return route_to_vendor("get_etf_profile", ticker, curr_date)
+
+
+@tool
 def get_balance_sheet(
     ticker: Annotated[str, "6-digit A-stock code (e.g. 600379). Must be numeric, NOT company name"],
     freq: Annotated[str, "reporting frequency: annual/quarterly"] = "quarterly",

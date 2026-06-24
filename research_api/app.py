@@ -16,7 +16,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from tradingagents.dataflows.a_stock import resolve_ticker, _tencent_quote
+from tradingagents.dataflows.a_stock import (
+    resolve_ticker,
+    _eastmoney_security_snapshot,
+    _tencent_quote,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from research_api.job_store import ResearchJobStore
@@ -197,6 +201,7 @@ app = FastAPI(title="TradingAgents-Astock Research API", version="0.1.0")
 _api_metrics = ApiMetrics()
 _jobs: dict[str, _Job] = {}
 _lock = threading.Lock()
+_job_run_semaphore = threading.Semaphore(int(os.getenv("ASTOCK_MAX_CONCURRENT_JOBS", "1")))
 _job_store = ResearchJobStore()
 _HAS_CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _TICKER_RE = re.compile(r"^(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
@@ -278,16 +283,28 @@ def _build_config(request: ResearchJobRequest) -> dict[str, Any]:
     return config
 
 
-def _select_analysts(request: ResearchJobRequest) -> list[str]:
-    analysts = request.selected_analysts or [
-        "market",
-        "social",
-        "news",
-        "fundamentals",
-        "policy",
-        "hot_money",
-        "lockup",
-    ]
+def _select_analysts(request: ResearchJobRequest, ticker: str | None = None) -> list[str]:
+    if request.selected_analysts:
+        analysts = request.selected_analysts
+    elif ticker and re.fullmatch(r"[15]\d{5}", ticker):
+        analysts = [
+            "market",
+            "social",
+            "news",
+            "fundamentals",
+            "policy",
+            "hot_money",
+        ]
+    else:
+        analysts = [
+            "market",
+            "social",
+            "news",
+            "fundamentals",
+            "policy",
+            "hot_money",
+            "lockup",
+        ]
     invalid = sorted(set(analysts) - ALLOWED_ANALYSTS)
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unsupported analysts: {invalid}")
@@ -329,11 +346,13 @@ def _search_tickers_via_eastmoney(user_input: str) -> list[StockCandidate]:
         name = str(row.get("Name") or "").strip()
         classify = str(row.get("Classify") or "")
         security_type = str(row.get("SecurityType") or "")
-        if re.fullmatch(r"\d{6}", code) and (
+        is_supported_security = (
             not classify
-            or classify == "AStock"
-            or security_type in {"2", "25"}
-        ):
+            or classify in {"AStock", "Fund", "ETF"}
+            or security_type in {"2", "22", "24", "25"}
+            or code.startswith(("1", "5"))
+        )
+        if re.fullmatch(r"\d{6}", code) and is_supported_security:
             if code in seen:
                 continue
             seen.add(code)
@@ -425,38 +444,39 @@ def _summarize_state(
 
 
 def _run_job(job_id: str) -> None:
-    with _lock:
-        job = _jobs[job_id]
-        job.status = "running"
-        job.updated_at = time.time()
-        _job_store.save(job.persistence_record())
+    with _job_run_semaphore:
+        with _lock:
+            job = _jobs[job_id]
+            job.status = "running"
+            job.updated_at = time.time()
+            _job_store.save(job.persistence_record())
 
-    try:
-        graph = TradingAgentsGraph(
-            selected_analysts=job.selected_analysts,
-            config=job.config,
-            debug=False,
-        )
-        final_state, signal = graph.propagate(job.ticker, job.trade_date)
-        result = _summarize_state(
-            final_state,
-            ticker=job.ticker,
-            trade_date=job.trade_date,
-            signal=signal,
-            report_path=str(graph.last_log_path) if graph.last_log_path else None,
-        )
-        with _lock:
-            job.status = "succeeded"
-            job.signal = signal
-            job.result = result
-            job.updated_at = time.time()
-            _job_store.save(job.persistence_record())
-    except Exception as exc:
-        with _lock:
-            job.status = "failed"
-            job.error = str(exc)
-            job.updated_at = time.time()
-            _job_store.save(job.persistence_record())
+        try:
+            graph = TradingAgentsGraph(
+                selected_analysts=job.selected_analysts,
+                config=job.config,
+                debug=False,
+            )
+            final_state, signal = graph.propagate(job.ticker, job.trade_date)
+            result = _summarize_state(
+                final_state,
+                ticker=job.ticker,
+                trade_date=job.trade_date,
+                signal=signal,
+                report_path=str(graph.last_log_path) if graph.last_log_path else None,
+            )
+            with _lock:
+                job.status = "succeeded"
+                job.signal = signal
+                job.result = result
+                job.updated_at = time.time()
+                _job_store.save(job.persistence_record())
+        except Exception as exc:
+            with _lock:
+                job.status = "failed"
+                job.error = str(exc)
+                job.updated_at = time.time()
+                _job_store.save(job.persistence_record())
 
 
 def _restore_jobs() -> None:
@@ -546,6 +566,22 @@ def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
     for code in normalized:
         item = quote_map.get(code)
         if not item:
+            try:
+                snapshot = _eastmoney_security_snapshot(code)
+                if snapshot:
+                    item = {
+                        "name": snapshot.get("f58"),
+                        "price": float(snapshot.get("f43") or 0),
+                        "last_close": float(snapshot.get("f60") or 0),
+                        "open": float(snapshot.get("f46") or 0),
+                        "change_pct": float(snapshot.get("f170") or 0),
+                        "high": float(snapshot.get("f44") or 0),
+                        "low": float(snapshot.get("f45") or 0),
+                        "turnover_pct": float(snapshot.get("f168") or 0),
+                    }
+            except Exception:
+                item = None
+        if not item:
             continue
         quotes.append(
             {
@@ -570,7 +606,7 @@ def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
 def create_research_job(request: ResearchJobRequest) -> dict[str, Any]:
     ticker = _resolve_request_ticker(request.ticker)
     trade_date = request.trade_date or date.today().isoformat()
-    selected_analysts = _select_analysts(request)
+    selected_analysts = _select_analysts(request, ticker)
     config = _build_config(request)
     job_id = uuid.uuid4().hex
     job = _Job(
@@ -583,6 +619,13 @@ def create_research_job(request: ResearchJobRequest) -> dict[str, Any]:
     )
 
     with _lock:
+        for active_job in _jobs.values():
+            if (
+                active_job.ticker == ticker
+                and active_job.trade_date == trade_date
+                and active_job.status in {"queued", "running"}
+            ):
+                return active_job.snapshot()
         _jobs[job_id] = job
         _job_store.save(job.persistence_record())
 

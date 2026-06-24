@@ -3,6 +3,7 @@ from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_concept_blocks,
     get_dragon_tiger_board,
+    get_etf_profile,
     get_fund_flow,
     get_hot_stocks,
     get_industry_comparison,
@@ -24,6 +25,7 @@ def create_hot_money_tracker(llm):
 
         tools = [
             get_stock_data,
+            get_etf_profile,
             get_news,
             get_insider_transactions,
             get_hot_stocks,
@@ -67,6 +69,10 @@ def create_hot_money_tracker(llm):
             "\n4. 所属概念板块及当日板块涨幅"
             "\n5. 当日是否上榜热门股及题材归因"
             "\n6. 资金面总体判断"
+            "\n\n📌 ETF/上市基金特别规则："
+            "\n- 如果标的是 1/5 开头的 ETF/上市基金代码，必须调用 `get_etf_profile`，用 verified name 校验标的身份。"
+            "\n- ETF 资金面重点分析：场内成交量/成交额、近 20 日均量、净值/价格表现、资产配置、前十大持仓暴露、规模/份额变化（如数据源返回）、相关板块和宏观资金环境。"
+            "\n- 龙虎榜、内部人交易、大股东减持、个股主力资金等工具对 ETF 可能不适用；不可用时标注 [数据缺失/不适用]，不要据此编造游资结论。"
             + get_language_instruction()
         )
 

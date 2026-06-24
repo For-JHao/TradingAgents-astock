@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
+    get_etf_profile,
     get_balance_sheet,
     get_cashflow,
     get_fundamentals,
@@ -20,6 +21,7 @@ def create_fundamentals_analyst(llm):
 
         tools = [
             get_fundamentals,
+            get_etf_profile,
             get_balance_sheet,
             get_cashflow,
             get_income_statement,
@@ -51,6 +53,11 @@ def create_fundamentals_analyst(llm):
             "\n5. 资产负债率"
             "\n6. 经营性现金流与净利润比值"
             "\n7. 机构一致预期 EPS（调用 get_profit_forecast 获取）"
+            "\n\n📌 ETF/上市基金特别规则："
+            "\n- 如果标的是 1/5 开头的 6 位代码（如 562060、159915、510300），必须优先调用 `get_etf_profile(ticker, curr_date)`，并以其返回的 verified name 为唯一基金名称。"
+            "\n- ETF 不按上市公司基本面评价；不要强行套用 PE/PB、营收、净利润、ROE、资产负债表、利润表、现金流量表或 EPS。"
+            "\n- ETF 基本面报告必须改为基金画像：跟踪/主题线索、净值走势、近 1月/3月/6月/1年收益、资产配置、前十大持仓代码、规模/份额、基金经理、费率、成交活跃度、流动性风险。"
+            "\n- 如果某些 ETF 字段数据源没有返回，明确标注 [数据缺失: xxx]，不要编造。"
             + get_language_instruction()
         )
 

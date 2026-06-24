@@ -9,7 +9,7 @@ from .analysts.news_analyst import create_news_analyst
 from .analysts.policy_analyst import create_policy_analyst
 from .analysts.social_media_analyst import create_social_media_analyst
 
-from .quality_gate import create_quality_gate
+from .quality_gate import create_etf_data_guard, create_quality_gate
 
 from .researchers.bear_researcher import create_bear_researcher
 from .researchers.bull_researcher import create_bull_researcher
@@ -40,6 +40,7 @@ __all__ = [
     "create_aggressive_debator",
     "create_policy_analyst",
     "create_quality_gate",
+    "create_etf_data_guard",
     "create_portfolio_manager",
     "create_conservative_debator",
     "create_social_media_analyst",
