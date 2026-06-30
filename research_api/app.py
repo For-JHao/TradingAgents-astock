@@ -43,7 +43,7 @@ ALLOWED_ANALYSTS = {
 
 DEFAULT_MODELS = {
     "minimax": ("MiniMax-M2.7-highspeed", "MiniMax-M2.7"),
-    "deepseek": ("deepseek-chat", "deepseek-chat"),
+    "deepseek": ("deepseek-v4-flash", "deepseek-v4-pro"),
     "qwen": ("qwen-plus", "qwen3.6-plus"),
     "glm": ("glm-5", "glm-5.1"),
     "openai": ("gpt-5.4-mini", "gpt-5.4"),

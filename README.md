@@ -207,8 +207,8 @@ config = {
 # ── DeepSeek 示例 ───────────────────────────────────
 # config = {
 #     "llm_provider": "deepseek",
-#     "deep_think_llm": "deepseek-chat",
-#     "quick_think_llm": "deepseek-chat",
+#     "deep_think_llm": "deepseek-v4-pro",
+#     "quick_think_llm": "deepseek-v4-flash",
 #     "output_language": "Chinese",
 # }
 
