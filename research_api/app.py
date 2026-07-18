@@ -56,6 +56,13 @@ DEFAULT_MODELS = {
 
 class ResearchJobRequest(BaseModel):
     ticker: str = Field(description="6-digit A-share code or Chinese stock name")
+    client_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        description="Stable caller-generated idempotency reference.",
+    )
     trade_date: str | None = Field(
         default=None,
         description="Analysis date in YYYY-MM-DD format. Defaults to today.",
@@ -72,6 +79,7 @@ class ResearchJobRequest(BaseModel):
 
 class ResearchJobCreated(BaseModel):
     job_id: str
+    client_request_id: str | None = None
     status: str
     ticker: str
     requested_ticker: str
@@ -80,6 +88,7 @@ class ResearchJobCreated(BaseModel):
 
 class ResearchJobStatus(BaseModel):
     job_id: str
+    client_request_id: str | None = None
     status: Literal["queued", "running", "succeeded", "failed"]
     ticker: str
     requested_ticker: str
@@ -156,6 +165,7 @@ class _Job:
     def snapshot(self, include_result: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
             "job_id": self.job_id,
+            "client_request_id": self.request.client_request_id,
             "status": self.status,
             "ticker": self.ticker,
             "requested_ticker": self.request.ticker,
@@ -604,6 +614,12 @@ def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
 
 @app.post("/research/jobs", response_model=ResearchJobCreated)
 def create_research_job(request: ResearchJobRequest) -> dict[str, Any]:
+    if request.client_request_id:
+        with _lock:
+            existing = _find_job_by_client_request_id(request.client_request_id)
+            if existing:
+                return _idempotent_job_snapshot(existing, request)
+
     ticker = _resolve_request_ticker(request.ticker)
     trade_date = request.trade_date or date.today().isoformat()
     selected_analysts = _select_analysts(request, ticker)
@@ -619,20 +635,57 @@ def create_research_job(request: ResearchJobRequest) -> dict[str, Any]:
     )
 
     with _lock:
-        for active_job in _jobs.values():
-            if (
-                active_job.ticker == ticker
-                and active_job.trade_date == trade_date
-                and active_job.status in {"queued", "running"}
-            ):
-                return active_job.snapshot()
-        _jobs[job_id] = job
+        if request.client_request_id:
+            existing = _find_job_by_client_request_id(request.client_request_id)
+            if existing:
+                return _idempotent_job_snapshot(existing, request)
+        if not request.client_request_id:
+            for active_job in _jobs.values():
+                if (
+                    active_job.ticker == ticker
+                    and active_job.trade_date == trade_date
+                    and active_job.status in {"queued", "running"}
+                ):
+                    return active_job.snapshot()
         _job_store.save(job.persistence_record())
+        _jobs[job_id] = job
 
     thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
     thread.start()
 
     return job.snapshot()
+
+
+def _find_job_by_client_request_id(client_request_id: str) -> _Job | None:
+    return next(
+        (
+            job
+            for job in _jobs.values()
+            if job.request.client_request_id == client_request_id
+        ),
+        None,
+    )
+
+
+def _idempotent_job_snapshot(job: _Job, request: ResearchJobRequest) -> dict[str, Any]:
+    if job.request != request:
+        raise HTTPException(
+            status_code=409,
+            detail="client_request_id 已绑定不同的投研请求",
+        )
+    return job.snapshot()
+
+
+@app.get(
+    "/research/jobs/by-client-request-id/{client_request_id}",
+    response_model=ResearchJobStatus,
+)
+def get_research_job_by_client_request_id(client_request_id: str) -> dict[str, Any]:
+    with _lock:
+        job = _find_job_by_client_request_id(client_request_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Research job not found")
+        return job.snapshot()
 
 
 @app.get("/research/jobs/{job_id}", response_model=ResearchJobStatus)

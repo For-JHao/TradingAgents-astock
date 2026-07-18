@@ -340,8 +340,13 @@ TradingAgents-Astock/
 
 `tradingagents-research-api` 使用 SQLite WAL 保存任务状态，默认数据库位于
 `~/.tradingagents/research-api/jobs.db`，可通过 `ASTOCK_RESEARCH_DB_PATH` 修改。服务重启后，
-已完成任务仍可查询；重启时正在排队或运行的任务会安全地标记为失败，需要客户端重新提交，
-避免重复执行 Agent 工作流。
+已完成任务仍可查询；重启时正在排队或运行的任务会安全地标记为失败，需要调用方明确发起新任务，
+服务端不会自动重跑，避免重复执行 Agent 工作流。
+
+`POST /research/jobs` 可携带调用方生成的稳定 `client_request_id`。相同 ID 与相同 payload
+会幂等返回原任务，不同 payload 会返回 409；客户端可通过
+`GET /research/jobs/by-client-request-id/{client_request_id}` 在响应丢失或自身重启后只查询原任务，
+无需冒险重发创建请求。
 
 默认不逐条打印 HTTP 200 访问日志，HTTP 异常仍会输出。需要临时查看两个服务及 Research API
 全部接口的最近状态时运行：

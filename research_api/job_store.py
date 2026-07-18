@@ -35,11 +35,24 @@ class ResearchJobStore:
                 """
                 CREATE TABLE IF NOT EXISTS research_jobs (
                     job_id TEXT PRIMARY KEY,
+                    client_request_id TEXT,
                     status TEXT NOT NULL,
                     updated_at REAL NOT NULL,
                     payload_json TEXT NOT NULL
                 )
                 """
+            )
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(research_jobs)").fetchall()
+            }
+            if "client_request_id" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE research_jobs ADD COLUMN client_request_id TEXT"
+                )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS research_jobs_client_request_id_unique "
+                "ON research_jobs(client_request_id) WHERE client_request_id IS NOT NULL"
             )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS research_jobs_updated_idx "
@@ -66,22 +79,46 @@ class ResearchJobStore:
 
     def save(self, record: dict[str, Any]) -> None:
         job_id = str(record["job_id"])
+        client_request_id = record.get("client_request_id")
+        if client_request_id is not None:
+            client_request_id = str(client_request_id)
         status = str(record["status"])
         updated_at = float(record["updated_at"])
         payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
-            self._connection.execute(
-                """
-                INSERT INTO research_jobs(job_id, status, updated_at, payload_json)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    status = excluded.status,
-                    updated_at = excluded.updated_at,
-                    payload_json = excluded.payload_json
-                """,
-                (job_id, status, updated_at, payload),
-            )
-            self._connection.commit()
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO research_jobs(
+                        job_id, client_request_id, status, updated_at, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        client_request_id = excluded.client_request_id,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at,
+                        payload_json = excluded.payload_json
+                    """,
+                    (job_id, client_request_id, status, updated_at, payload),
+                )
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._connection.rollback()
+                raise ValueError("client_request_id already belongs to another research job") from exc
+
+    def load_by_client_request_id(self, client_request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload_json FROM research_jobs WHERE client_request_id = ?",
+                (client_request_id,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            value = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
 
     def load_all(self) -> list[dict[str, Any]]:
         with self._lock:

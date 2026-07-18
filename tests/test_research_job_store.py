@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,53 @@ from research_api.job_store import ResearchJobStore, restore_job_database
 
 
 class ResearchJobStoreTest(unittest.TestCase):
+    def test_legacy_schema_adds_client_request_id_without_losing_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.db"
+            legacy = {
+                "job_id": "legacy-job",
+                "status": "succeeded",
+                "updated_at": 1000.0,
+            }
+            connection = sqlite3.connect(database_path)
+            connection.execute(
+                """
+                CREATE TABLE research_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO research_jobs(job_id, status, updated_at, payload_json) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    legacy["job_id"],
+                    legacy["status"],
+                    legacy["updated_at"],
+                    json.dumps(legacy),
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = ResearchJobStore(database_path)
+            self.assertEqual(store.load_all(), [legacy])
+            current = {
+                "job_id": "current-job",
+                "client_request_id": "ASTOCKJOB-migrated-reference",
+                "status": "queued",
+                "updated_at": 2000.0,
+            }
+            store.save(current)
+            self.assertEqual(
+                store.load_by_client_request_id("ASTOCKJOB-migrated-reference"),
+                current,
+            )
+            store.close()
+
     def test_job_survives_reopen_and_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.db"
@@ -44,6 +93,38 @@ class ResearchJobStoreTest(unittest.TestCase):
             restored = ResearchJobStore(restore_target)
             self.assertEqual(restored.load_all(), [completed])
             restored.close()
+
+    def test_client_request_id_is_unique_and_queryable_after_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.db"
+            initial = {
+                "job_id": "job-1",
+                "client_request_id": "ASTOCKJOB-stable-reference",
+                "status": "queued",
+                "updated_at": 1000.0,
+            }
+            first = ResearchJobStore(database_path)
+            first.save(initial)
+            self.assertEqual(
+                first.load_by_client_request_id("ASTOCKJOB-stable-reference"),
+                initial,
+            )
+            first.close()
+
+            reopened = ResearchJobStore(database_path)
+            self.assertEqual(
+                reopened.load_by_client_request_id("ASTOCKJOB-stable-reference"),
+                initial,
+            )
+            with self.assertRaises(ValueError):
+                reopened.save(
+                    {
+                        **initial,
+                        "job_id": "job-2",
+                        "updated_at": 1001.0,
+                    }
+                )
+            reopened.close()
 
 
 if __name__ == "__main__":
