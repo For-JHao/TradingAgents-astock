@@ -24,10 +24,12 @@ import logging
 import math
 import random
 import re as _re
+import threading
 import time
 import uuid
 import urllib.request
 import contextlib
+import functools
 import io
 
 import pandas as pd
@@ -36,6 +38,28 @@ import requests as _requests
 from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
+_CACHE_LOCKS_GUARD = threading.Lock()
+_CACHE_LOCKS: dict[str, threading.RLock] = {}
+_NAME_CODE_LOCK = threading.RLock()
+_ETF_CACHE_LOCK = threading.RLock()
+
+
+def _cache_lock(path: str) -> threading.RLock:
+    normalized = os.path.abspath(path)
+    with _CACHE_LOCKS_GUARD:
+        return _CACHE_LOCKS.setdefault(normalized, threading.RLock())
+
+
+def _serialized(lock: threading.RLock):
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            with lock:
+                return function(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +112,7 @@ _name_to_code: dict[str, str] | None = None
 _code_to_name: dict[str, str] | None = None
 
 
+@_serialized(_NAME_CODE_LOCK)
 def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
     """Build name→code and code→name maps via mootdx (both SH & SZ markets)."""
     global _name_to_code, _code_to_name
@@ -156,16 +181,24 @@ def resolve_ticker(user_input: str) -> str:
 # ---------------------------------------------------------------------------
 
 _mootdx_client = None
+_MOOTDX_LOCK = threading.RLock()
 
 
 def _get_mootdx_client():
     """Lazy-init mootdx Quotes client (TCP connection, reusable)."""
     global _mootdx_client
-    if _mootdx_client is None:
-        from mootdx.quotes import Quotes
+    with _MOOTDX_LOCK:
+        if _mootdx_client is None:
+            from mootdx.quotes import Quotes
 
-        _mootdx_client = Quotes.factory(market="std")
-    return _mootdx_client
+            _mootdx_client = Quotes.factory(market="std")
+        return _mootdx_client
+
+
+def _mootdx_call(method: str, *args, **kwargs):
+    """Serialize access to mootdx's reusable TCP client."""
+    with _MOOTDX_LOCK:
+        return getattr(_get_mootdx_client(), method)(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +265,7 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 # 不限流（实测不封 IP 或风控极弱）。批量任务可调大 EM_MIN_INTERVAL 进一步降速。
 _EM_SESSION = _requests.Session()
 _EM_SESSION.headers.update({"User-Agent": _UA})
+_EM_LOCK = threading.RLock()
 # 两次东财请求最小间隔(秒)；批量多 Agent 场景可设环境变量 EM_MIN_INTERVAL=1.5~2 降速。
 _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
@@ -298,15 +332,16 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     串行限流：与上次东财请求间隔 < EM_MIN_INTERVAL 时 sleep 补足 + 0.1~0.5s 随机抖动。
     传入的 headers 会覆盖 session 默认 UA（用于保留各端点自己的 Referer/Origin）。
     """
-    wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-    if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
-    try:
-        return _EM_SESSION.get(
-            url, params=params, headers=headers, timeout=timeout, **kwargs
-        )
-    finally:
-        _em_last_call[0] = time.time()
+    with _EM_LOCK:
+        wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        try:
+            return _EM_SESSION.get(
+                url, params=params, headers=headers, timeout=timeout, **kwargs
+            )
+        finally:
+            _em_last_call[0] = time.time()
 
 
 def _eastmoney_datacenter(
@@ -628,6 +663,7 @@ def _akshare_etf_kline(
     return result
 
 
+@_serialized(_ETF_CACHE_LOCK)
 def get_etf_verified_name(code: str) -> str:
     """Return verified ETF/listed fund name from trusted public sources."""
     normalized = _normalize_ticker(code)
@@ -757,6 +793,7 @@ def _format_top_holdings(script_text: str) -> list[str]:
     return lines
 
 
+@_serialized(_ETF_CACHE_LOCK)
 def get_etf_profile(
     ticker: Annotated[str, "ETF/listed fund code"],
     curr_date: Annotated[str, "current date"] = None,
@@ -962,8 +999,7 @@ def _load_kline_with_fallbacks(
 ) -> tuple[pd.DataFrame, str]:
     """Load daily K-line from mootdx, then AKShare/Eastmoney, then Sina."""
     try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
+        df = _mootdx_call("bars", symbol=code, category=4, offset=800)
 
         if df is None or df.empty:
             raise ValueError(f"No data from mootdx for {code}")
@@ -1041,25 +1077,23 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
 
     cache_file = os.path.join(cache_dir, f"{code}-astock-daily.csv")
 
-    if os.path.exists(cache_file):
-        mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
-        if mtime.date() == datetime.now().date():
-            data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
-            data["Date"] = pd.to_datetime(data["Date"])
-            cutoff = pd.to_datetime(curr_date)
-            return data[data["Date"] <= cutoff]
+    with _cache_lock(cache_file):
+        if os.path.exists(cache_file):
+            mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
+            if mtime.date() == datetime.now().date():
+                data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
+                data["Date"] = pd.to_datetime(data["Date"])
+                cutoff = pd.to_datetime(curr_date)
+                return data[data["Date"] <= cutoff]
 
-    df, _ = _load_kline_with_fallbacks(code)
-    if df.empty:
-        raise ValueError(f"No OHLCV data from mootdx/eastmoney/sina for {code}")
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        df, _ = _load_kline_with_fallbacks(code)
+        if df.empty:
+            raise ValueError(f"No OHLCV data from mootdx/eastmoney/sina for {code}")
+        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        df.to_csv(cache_file, index=False, encoding="utf-8")
 
-    # Cache to disk
-    df.to_csv(cache_file, index=False, encoding="utf-8")
-
-    # Filter by curr_date to prevent look-ahead bias
-    cutoff = pd.to_datetime(curr_date)
-    return df[df["Date"] <= cutoff]
+        cutoff = pd.to_datetime(curr_date)
+        return df[df["Date"] <= cutoff]
 
 
 # ===========================================================================
@@ -1231,8 +1265,7 @@ def get_fundamentals(
 
         # --- mootdx: financial snapshot (quarterly) ---
         try:
-            client = _get_mootdx_client()
-            fin = client.finance(symbol=code)
+            fin = _mootdx_call("finance", symbol=code)
             if fin is not None and not (
                 isinstance(fin, pd.DataFrame) and fin.empty
             ):
@@ -1787,8 +1820,7 @@ def get_insider_transactions(
     code = _normalize_ticker(ticker)
 
     try:
-        client = _get_mootdx_client()
-        text = client.F10(symbol=code, name="股东研究")
+        text = _mootdx_call("F10", symbol=code, name="股东研究")
 
         if not text or not text.strip():
             return f"No insider/shareholder data found for A-stock '{code}'"
@@ -2017,21 +2049,22 @@ def _save_northbound_snapshot(date_str: str, hgt: float, sgt: float) -> None:
     import csv
 
     path = _northbound_cache_path()
-    existing: dict[str, tuple[str, str]] = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if len(row) >= 3:
-                    existing[row[0]] = (row[1], row[2])
-    existing[date_str] = (f"{hgt:.2f}", f"{sgt:.2f}")
-    sorted_dates = sorted(existing.keys())
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["date", "hgt", "sgt"])
-        for d in sorted_dates:
-            writer.writerow([d, existing[d][0], existing[d][1]])
+    with _cache_lock(path):
+        existing: dict[str, tuple[str, str]] = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                for row in reader:
+                    if len(row) >= 3:
+                        existing[row[0]] = (row[1], row[2])
+        existing[date_str] = (f"{hgt:.2f}", f"{sgt:.2f}")
+        sorted_dates = sorted(existing.keys())
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "hgt", "sgt"])
+            for d in sorted_dates:
+                writer.writerow([d, existing[d][0], existing[d][1]])
 
 
 def _load_northbound_history(n: int = 20) -> list[tuple[str, float, float]]:
@@ -2039,19 +2072,20 @@ def _load_northbound_history(n: int = 20) -> list[tuple[str, float, float]]:
     import csv
 
     path = _northbound_cache_path()
-    if not os.path.exists(path):
-        return []
-    rows: list[tuple[str, float, float]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        next(reader, None)
-        for row in reader:
-            if len(row) >= 3:
-                try:
-                    rows.append((row[0], float(row[1]), float(row[2])))
-                except ValueError:
-                    continue
-    return rows[-n:]
+    with _cache_lock(path):
+        if not os.path.exists(path):
+            return []
+        rows: list[tuple[str, float, float]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) >= 3:
+                    try:
+                        rows.append((row[0], float(row[1]), float(row[2])))
+                    except ValueError:
+                        continue
+        return rows[-n:]
 
 
 def get_northbound_flow(

@@ -348,6 +348,18 @@ TradingAgents-Astock/
 `GET /research/jobs/by-client-request-id/{client_request_id}` 在响应丢失或自身重启后只查询原任务，
 无需冒险重发创建请求。
 
+Research API 默认允许 **2 个投研任务并行执行**，可通过 `ASTOCK_MAX_CONCURRENT_JOBS`
+在 1~8 之间调整；并发槽位占满后，新任务保持 `queued`，不会取消或终止正在执行的任务。
+不同任务的运行配置、记忆文件更新、行情缓存和结果日志已做并发隔离；东财和 mootdx 的共享客户端调用
+仍在请求级串行，以避免数据源限流和客户端线程安全问题，Agent 图和 LLM 请求可以并行。建议生产环境先保持
+默认值 2，因为并发会近似增加单位时间内的 LLM 请求/Token 消耗和内存占用（单任务总量不因并发改变）；
+遇到上游限流时可设为 1 回退串行。
+
+任务状态会返回 `attempt`、`stage`、`error_type` 和 `error_stage`。完整异常堆栈只持久化在任务数据库中，
+不通过公共 API 暴露。对于超时、限流、空响应和临时拆包异常，默认整任务额外重试 1 次；可通过
+`ASTOCK_TRANSIENT_JOB_RETRIES`（0~3）和 `ASTOCK_TRANSIENT_RETRY_DELAY_SECONDS` 调整。
+整任务重试可能重复产生模型调用费用，若调用方需要严格控制成本，可将重试次数设为 0。
+
 默认不逐条打印 HTTP 200 访问日志，HTTP 异常仍会输出。需要临时查看两个服务及 Research API
 全部接口的最近状态时运行：
 

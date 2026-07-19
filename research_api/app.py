@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import traceback
 import uuid
 from datetime import date
 from pathlib import Path
@@ -95,7 +96,11 @@ class ResearchJobStatus(BaseModel):
     trade_date: str
     created_at: float
     updated_at: float
+    attempt: int = 0
+    stage: str | None = None
     error: str | None = None
+    error_type: str | None = None
+    error_stage: str | None = None
     signal: str | None = None
 
 
@@ -158,7 +163,12 @@ class _Job:
         self.status: Literal["queued", "running", "succeeded", "failed"] = "queued"
         self.created_at = now
         self.updated_at = now
+        self.attempt = 0
+        self.stage: str | None = "queued"
         self.error: str | None = None
+        self.error_type: str | None = None
+        self.error_stage: str | None = None
+        self.error_traceback: str | None = None
         self.signal: str | None = None
         self.result: dict[str, Any] | None = None
 
@@ -172,7 +182,11 @@ class _Job:
             "trade_date": self.trade_date,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "attempt": self.attempt,
+            "stage": self.stage,
             "error": self.error,
+            "error_type": self.error_type,
+            "error_stage": self.error_stage,
             "signal": self.signal,
         }
         if include_result:
@@ -185,6 +199,7 @@ class _Job:
             "request": self.request.model_dump(mode="json"),
             "config": self.config,
             "selected_analysts": self.selected_analysts,
+            "error_traceback": self.error_traceback,
         }
 
     @classmethod
@@ -201,7 +216,12 @@ class _Job:
         job.status = str(record["status"])
         job.created_at = float(record["created_at"])
         job.updated_at = float(record["updated_at"])
+        job.attempt = int(record.get("attempt") or 0)
+        job.stage = record.get("stage")
         job.error = record.get("error")
+        job.error_type = record.get("error_type")
+        job.error_stage = record.get("error_stage")
+        job.error_traceback = record.get("error_traceback")
         job.signal = record.get("signal")
         job.result = record.get("result")
         return job
@@ -211,7 +231,29 @@ app = FastAPI(title="TradingAgents-Astock Research API", version="0.1.0")
 _api_metrics = ApiMetrics()
 _jobs: dict[str, _Job] = {}
 _lock = threading.Lock()
-_job_run_semaphore = threading.Semaphore(int(os.getenv("ASTOCK_MAX_CONCURRENT_JOBS", "1")))
+
+
+def _bounded_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+_MAX_CONCURRENT_JOBS = _bounded_env_int(
+    "ASTOCK_MAX_CONCURRENT_JOBS", 2, minimum=1, maximum=8
+)
+_TRANSIENT_JOB_RETRIES = _bounded_env_int(
+    "ASTOCK_TRANSIENT_JOB_RETRIES", 1, minimum=0, maximum=3
+)
+try:
+    _TRANSIENT_RETRY_DELAY_SECONDS = max(
+        0.0, float(os.getenv("ASTOCK_TRANSIENT_RETRY_DELAY_SECONDS", "2"))
+    )
+except (TypeError, ValueError):
+    _TRANSIENT_RETRY_DELAY_SECONDS = 2.0
+_job_run_semaphore = threading.BoundedSemaphore(_MAX_CONCURRENT_JOBS)
 _job_store = ResearchJobStore()
 _HAS_CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _TICKER_RE = re.compile(r"^(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
@@ -455,38 +497,94 @@ def _summarize_state(
 
 def _run_job(job_id: str) -> None:
     with _job_run_semaphore:
-        with _lock:
-            job = _jobs[job_id]
-            job.status = "running"
-            job.updated_at = time.time()
-            _job_store.save(job.persistence_record())
+        job = _jobs[job_id]
+        max_attempts = 1 + _TRANSIENT_JOB_RETRIES
+        for attempt in range(1, max_attempts + 1):
+            with _lock:
+                job.status = "running"
+                job.attempt = attempt
+                job.stage = "graph_initialization"
+                job.updated_at = time.time()
+                _job_store.save(job.persistence_record())
 
-        try:
-            graph = TradingAgentsGraph(
-                selected_analysts=job.selected_analysts,
-                config=job.config,
-                debug=False,
-            )
-            final_state, signal = graph.propagate(job.ticker, job.trade_date)
-            result = _summarize_state(
-                final_state,
-                ticker=job.ticker,
-                trade_date=job.trade_date,
-                signal=signal,
-                report_path=str(graph.last_log_path) if graph.last_log_path else None,
-            )
-            with _lock:
-                job.status = "succeeded"
-                job.signal = signal
-                job.result = result
-                job.updated_at = time.time()
-                _job_store.save(job.persistence_record())
-        except Exception as exc:
-            with _lock:
-                job.status = "failed"
-                job.error = str(exc)
-                job.updated_at = time.time()
-                _job_store.save(job.persistence_record())
+            try:
+                graph = TradingAgentsGraph(
+                    selected_analysts=job.selected_analysts,
+                    config=job.config,
+                    debug=False,
+                )
+                with _lock:
+                    job.stage = "graph_execution"
+                    job.updated_at = time.time()
+                    _job_store.save(job.persistence_record())
+                final_state, signal = graph.propagate(job.ticker, job.trade_date)
+                with _lock:
+                    job.stage = "result_summarization"
+                    job.updated_at = time.time()
+                    _job_store.save(job.persistence_record())
+                result = _summarize_state(
+                    final_state,
+                    ticker=job.ticker,
+                    trade_date=job.trade_date,
+                    signal=signal,
+                    report_path=str(graph.last_log_path) if graph.last_log_path else None,
+                )
+                with _lock:
+                    job.status = "succeeded"
+                    job.stage = "completed"
+                    job.error = None
+                    job.error_type = None
+                    job.error_stage = None
+                    job.error_traceback = None
+                    job.signal = signal
+                    job.result = result
+                    job.updated_at = time.time()
+                    _job_store.save(job.persistence_record())
+                return
+            except Exception as exc:
+                error_stage = job.stage or "unknown"
+                error_traceback = traceback.format_exc()
+                should_retry = attempt < max_attempts and _is_transient_job_error(exc)
+                with _lock:
+                    job.error = str(exc)
+                    job.error_type = type(exc).__name__
+                    job.error_stage = error_stage
+                    job.error_traceback = error_traceback
+                    job.stage = "retry_wait" if should_retry else error_stage
+                    job.updated_at = time.time()
+                    if not should_retry:
+                        job.status = "failed"
+                    _job_store.save(job.persistence_record())
+                print(
+                    f"[research-api] job {job.job_id} attempt {attempt}/{max_attempts} "
+                    f"failed at {error_stage}: {type(exc).__name__}: {exc}"
+                )
+                if should_retry:
+                    if _TRANSIENT_RETRY_DELAY_SECONDS:
+                        time.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+                    continue
+                print(error_traceback)
+                return
+
+
+def _is_transient_job_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    markers = (
+        "not enough values to unpack",
+        "empty response",
+        "connection error",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "rate limit",
+        "too many requests",
+        "http 429",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(marker in message for marker in markers)
 
 
 def _restore_jobs() -> None:
@@ -497,8 +595,12 @@ def _restore_jobs() -> None:
             print(f"[research-api] skip invalid persisted job: {exc}")
             continue
         if job.status in {"queued", "running"}:
+            interrupted_stage = job.stage or job.status
             job.status = "failed"
+            job.stage = interrupted_stage
             job.error = "投研服务曾重启，原任务执行状态无法安全续跑，请重新提交"
+            job.error_type = "ServiceRestarted"
+            job.error_stage = interrupted_stage
             job.updated_at = time.time()
             _job_store.save(job.persistence_record())
         _jobs[job.job_id] = job
@@ -509,10 +611,20 @@ _restore_jobs()
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    with _lock:
+        job_counts = {
+            status: sum(1 for job in _jobs.values() if job.status == status)
+            for status in ("queued", "running", "succeeded", "failed")
+        }
     return {
         "status": "ok",
         "service": "tradingagents-astock-research-api",
         "jobs": len(_jobs),
+        "execution": {
+            "max_concurrent_jobs": _MAX_CONCURRENT_JOBS,
+            "transient_job_retries": _TRANSIENT_JOB_RETRIES,
+            "job_counts": job_counts,
+        },
         "database": _job_store.health(),
     }
 

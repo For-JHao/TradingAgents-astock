@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import json
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
 
@@ -59,7 +60,7 @@ from .signal_processing import SignalProcessor
 def states_log_filename(trade_date: str, ts: datetime | None = None) -> str:
     """Build a unique on-disk log filename for one analysis run."""
     ts = ts or datetime.now()
-    return f"full_states_log_{trade_date}_{ts.strftime('%H%M%S')}.json"
+    return f"full_states_log_{trade_date}_{ts.strftime('%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"
 
 
 class TradingAgentsGraph:
