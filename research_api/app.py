@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import threading
 import time
 import traceback
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -18,8 +19,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from tradingagents.dataflows.a_stock import (
+    _akshare_etf_kline,
+    _eastmoney_kline_fallback,
     resolve_ticker,
     _eastmoney_security_snapshot,
+    _is_etf_like_code,
     _tencent_quote,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -140,6 +144,28 @@ class MarketQuoteItem(BaseModel):
 
 class MarketQuotesResponse(BaseModel):
     quotes: list[MarketQuoteItem]
+
+
+class DailyMarketBarsRequest(BaseModel):
+    codes: list[str] = Field(min_length=1, max_length=5)
+    from_date: str
+    to_date: str
+    include_prior_session: bool = False
+
+
+class DailyMarketBarItem(BaseModel):
+    code: str
+    trade_date: str
+    close: float
+    previous_close: float | None = None
+    change_pct: float | None = None
+    source: str
+    adjustment_mode: Literal["qfq"] = "qfq"
+
+
+class DailyMarketBarsResponse(BaseModel):
+    bars: list[DailyMarketBarItem]
+    unavailable: list[dict[str, str]]
 
 
 class _Job:
@@ -361,6 +387,101 @@ def _select_analysts(request: ResearchJobRequest, ticker: str | None = None) -> 
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unsupported analysts: {invalid}")
     return analysts
+
+
+def _akshare_qfq_kline(code: str, start_date: str, end_date: str):
+    if _is_etf_like_code(code):
+        return _akshare_etf_kline(code, start_date, end_date)
+    try:
+        import akshare as ak
+    except Exception as exc:
+        raise RuntimeError("AKShare is not installed") from exc
+    frame = ak.stock_zh_a_hist(
+        symbol=code,
+        period="daily",
+        start_date=start_date.replace("-", ""),
+        end_date=end_date.replace("-", ""),
+        adjust="qfq",
+    )
+    if frame is None or frame.empty:
+        return frame
+    frame = frame.rename(columns={"日期": "Date", "收盘": "Close"})
+    return frame
+
+
+def _daily_bars_for_code(
+    code: str,
+    from_date: date,
+    to_date: date,
+    *,
+    include_prior_session: bool = False,
+) -> list[dict[str, Any]]:
+    buffered_from = (from_date - timedelta(days=14)).isoformat()
+
+    def load_frame(start_date: str):
+        selected_source = "eastmoney_push2his"
+        try:
+            selected_frame = _eastmoney_kline_fallback(
+                code, start_date, to_date.isoformat()
+            )
+        except Exception:
+            selected_frame = None
+        if selected_frame is None or selected_frame.empty:
+            selected_source = "akshare_qfq"
+            selected_frame = _akshare_qfq_kline(
+                code, start_date, to_date.isoformat()
+            )
+        return selected_frame, selected_source
+
+    frame, source = load_frame(buffered_from)
+    if include_prior_session:
+        has_prior = False
+        if frame is not None and not frame.empty and "Date" in frame:
+            has_prior = any(
+                date.fromisoformat(str(value)[:10]) < from_date
+                for value in frame["Date"]
+            )
+        if not has_prior:
+            frame, source = load_frame("1990-01-01")
+    if frame is None or frame.empty or "Date" not in frame or "Close" not in frame:
+        raise RuntimeError("前复权日线数据源未返回有效数据")
+
+    rows: list[dict[str, Any]] = []
+    prior_row: dict[str, Any] | None = None
+    previous_close: float | None = None
+    for _, row in frame.sort_values("Date").iterrows():
+        raw_trade_day = row["Date"]
+        trade_day = (
+            raw_trade_day.date()
+            if hasattr(raw_trade_day, "date")
+            else date.fromisoformat(str(raw_trade_day)[:10])
+        )
+        close = float(row["Close"])
+        if not math.isfinite(close) or close <= 0:
+            continue
+        item = {
+            "code": code,
+            "trade_date": trade_day.isoformat(),
+            "close": close,
+            "previous_close": previous_close,
+            "change_pct": (
+                ((close / previous_close) - 1) * 100
+                if previous_close and previous_close > 0
+                else None
+            ),
+            "source": source,
+            "adjustment_mode": "qfq",
+        }
+        if trade_day < from_date:
+            prior_row = item
+        elif trade_day <= to_date:
+            rows.append(item)
+        previous_close = close
+    if include_prior_session and prior_row:
+        rows.insert(0, prior_row)
+    if not rows:
+        raise RuntimeError("请求区间内没有已完成的交易日")
+    return rows
 
 
 def _search_tickers_via_eastmoney(user_input: str) -> list[StockCandidate]:
@@ -766,6 +887,38 @@ def create_research_job(request: ResearchJobRequest) -> dict[str, Any]:
     thread.start()
 
     return job.snapshot()
+
+
+@app.post("/market/daily-bars", response_model=DailyMarketBarsResponse)
+def get_daily_market_bars(request: DailyMarketBarsRequest) -> dict[str, Any]:
+    try:
+        from_date = date.fromisoformat(request.from_date)
+        to_date = date.fromisoformat(request.to_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="from_date/to_date 必须为 YYYY-MM-DD") from exc
+    if from_date > to_date:
+        raise HTTPException(status_code=400, detail="from_date 不能晚于 to_date")
+
+    normalized: list[str] = []
+    for value in request.codes:
+        ticker = _resolve_request_ticker(value)
+        if ticker not in normalized:
+            normalized.append(ticker)
+    bars: list[dict[str, Any]] = []
+    unavailable: list[dict[str, str]] = []
+    for ticker in normalized:
+        try:
+            bars.extend(
+                _daily_bars_for_code(
+                    ticker,
+                    from_date,
+                    to_date,
+                    include_prior_session=request.include_prior_session,
+                )
+            )
+        except Exception as exc:
+            unavailable.append({"code": ticker, "reason": str(exc)})
+    return {"bars": bars, "unavailable": unavailable}
 
 
 def _find_job_by_client_request_id(client_request_id: str) -> _Job | None:
