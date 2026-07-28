@@ -13,6 +13,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -491,14 +492,14 @@ def _search_tickers_via_eastmoney(user_input: str) -> list[StockCandidate]:
     the full name-code map during HTTP job creation.
     """
     try:
-        response = requests.get(
+        response = httpx.get(
             "https://searchapi.eastmoney.com/api/suggest/get",
             params={"input": user_input, "type": "14"},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=8,
         )
         response.raise_for_status()
-        data = json.loads(response.content.decode("utf-8", errors="replace"))
+        data = response.json()
     except Exception:
         return []
 
