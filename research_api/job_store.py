@@ -28,6 +28,13 @@ class ResearchJobStore:
         )
         self._connection.row_factory = sqlite3.Row
         with self._lock:
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(research_jobs)").fetchall()
+            }
+            if columns and "client_request_id" not in columns:
+                self._connection.close()
+                raise ValueError("unsupported research job database schema: client_request_id is required")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
             self._connection.execute("PRAGMA busy_timeout = 5000")
@@ -42,14 +49,6 @@ class ResearchJobStore:
                 )
                 """
             )
-            columns = {
-                str(row["name"])
-                for row in self._connection.execute("PRAGMA table_info(research_jobs)").fetchall()
-            }
-            if "client_request_id" not in columns:
-                self._connection.execute(
-                    "ALTER TABLE research_jobs ADD COLUMN client_request_id TEXT"
-                )
             self._connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS research_jobs_client_request_id_unique "
                 "ON research_jobs(client_request_id) WHERE client_request_id IS NOT NULL"
@@ -157,6 +156,9 @@ def validate_job_database(database_path: str | Path) -> None:
         ).fetchone()
         if not table:
             raise ValueError("not a research job database")
+        columns = {str(row[1]) for row in source.execute("PRAGMA table_info(research_jobs)")}
+        if "client_request_id" not in columns:
+            raise ValueError("unsupported research job database schema: client_request_id is required")
     finally:
         source.close()
 

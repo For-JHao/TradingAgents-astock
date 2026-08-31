@@ -10,7 +10,7 @@ from research_api.job_store import ResearchJobStore, restore_job_database
 
 
 class ResearchJobStoreTest(unittest.TestCase):
-    def test_legacy_schema_adds_client_request_id_without_losing_jobs(self) -> None:
+    def test_legacy_schema_is_rejected_without_changing_jobs_or_reports(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.db"
             legacy = {
@@ -41,21 +41,31 @@ class ResearchJobStoreTest(unittest.TestCase):
             )
             connection.commit()
             connection.close()
+            before = database_path.read_bytes()
+            reports = Path(directory) / "reports"
+            reports.mkdir()
+            report = reports / "full_states_log_2026-08-31.json"
+            report_bytes = b'{"final_trade_decision":"synthetic report"}'
+            report.write_bytes(report_bytes)
 
-            store = ResearchJobStore(database_path)
-            self.assertEqual(store.load_all(), [legacy])
-            current = {
-                "job_id": "current-job",
-                "client_request_id": "ASTOCKJOB-migrated-reference",
-                "status": "queued",
-                "updated_at": 2000.0,
-            }
-            store.save(current)
-            self.assertEqual(
-                store.load_by_client_request_id("ASTOCKJOB-migrated-reference"),
-                current,
-            )
-            store.close()
+            with self.assertRaisesRegex(ValueError, "unsupported research job database schema"):
+                ResearchJobStore(database_path)
+
+            self.assertEqual(database_path.read_bytes(), before)
+            with sqlite3.connect(database_path) as unchanged:
+                columns = [row[1] for row in unchanged.execute("PRAGMA table_info(research_jobs)")]
+                self.assertNotIn("client_request_id", columns)
+                rows = unchanged.execute("SELECT payload_json FROM research_jobs").fetchall()
+                self.assertEqual([json.loads(row[0]) for row in rows], [legacy])
+            self.assertEqual(report.read_bytes(), report_bytes)
+            current_path = Path(directory) / "current.db"
+            ResearchJobStore(current_path).close()
+            current_before = current_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "unsupported research job database schema"):
+                restore_job_database(database_path, current_path)
+            self.assertEqual(current_path.read_bytes(), current_before)
+            self.assertFalse(current_path.with_suffix(".db.before-restore").exists())
+            self.assertEqual(report.read_bytes(), report_bytes)
 
     def test_job_survives_reopen_and_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
