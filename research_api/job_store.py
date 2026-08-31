@@ -74,6 +74,7 @@ class ResearchJobStore:
                 self._connection.backup(target)
         finally:
             target.close()
+        validate_job_database(destination)
         return destination
 
     def save(self, record: dict[str, Any]) -> None:
@@ -170,6 +171,15 @@ def restore_job_database(source_path: str | Path, destination_path: str | Path) 
         raise ValueError("restore source cannot be the active research job database")
     validate_job_database(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        # Preserve committed WAL records in the existing before-restore file.
+        current = sqlite3.connect(destination, timeout=0)
+        try:
+            result = current.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if not result or result[0] != 0 or result[1] != result[2]:
+                raise ValueError("restore WAL checkpoint incomplete; stop database users first")
+        finally:
+            current.close()
     temporary = destination.with_suffix(destination.suffix + ".restore.tmp")
     previous = destination.with_suffix(destination.suffix + ".before-restore")
     temporary.unlink(missing_ok=True)

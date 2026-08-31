@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,42 @@ from research_api.job_store import ResearchJobStore, restore_job_database
 
 
 class ResearchJobStoreTest(unittest.TestCase):
+    def test_restore_preserves_crashed_wal_and_refuses_busy_checkpoint(self) -> None:
+        for busy in (False, True):
+            with self.subTest(busy=busy), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "source.db"
+                destination = Path(directory) / "current.db"
+                ResearchJobStore(source).close()
+                subprocess.run([
+                    sys.executable, "-c",
+                    "import os, sqlite3, sys; "
+                    "db = sqlite3.connect(sys.argv[1]); "
+                    "db.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; "
+                    "CREATE TABLE restore_test (id INTEGER); INSERT INTO restore_test VALUES (1); "
+                    "PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO restore_test VALUES (2);'); "
+                    "os._exit(0)", str(destination),
+                ], check=True)
+                self.assertTrue(Path(f"{destination}-wal").exists())
+                if busy:
+                    reader = sqlite3.connect(destination)
+                    try:
+                        reader.execute("BEGIN")
+                        reader.execute("SELECT * FROM restore_test").fetchall()
+                        with self.assertRaisesRegex(ValueError, "checkpoint incomplete"):
+                            restore_job_database(source, destination)
+                        self.assertFalse(destination.with_suffix(".db.before-restore").exists())
+                        self.assertFalse(destination.with_suffix(".db.restore.tmp").exists())
+                        self.assertEqual(reader.execute("SELECT COUNT(*) FROM restore_test").fetchone()[0], 2)
+                    finally:
+                        reader.close()
+                else:
+                    previous = restore_job_database(source, destination)
+                    with sqlite3.connect(previous) as retained:
+                        self.assertEqual(retained.execute("SELECT COUNT(*) FROM restore_test").fetchone()[0], 2)
+                    restored = ResearchJobStore(destination)
+                    self.assertEqual(restored.load_all(), [])
+                    restored.close()
+
     def test_legacy_schema_is_rejected_without_changing_jobs_or_reports(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "jobs.db"
@@ -103,6 +141,18 @@ class ResearchJobStoreTest(unittest.TestCase):
             restored = ResearchJobStore(restore_target)
             self.assertEqual(restored.load_all(), [completed])
             restored.close()
+
+    def test_backup_rejects_an_invalid_snapshot_before_reporting_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "jobs.db"
+            store = ResearchJobStore(database_path)
+            try:
+                with sqlite3.connect(database_path) as source:
+                    source.execute("DROP TABLE research_jobs")
+                with self.assertRaisesRegex(ValueError, "not a research job database"):
+                    store.backup_to(Path(directory) / "invalid-backup.db")
+            finally:
+                store.close()
 
     def test_client_request_id_is_unique_and_queryable_after_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
