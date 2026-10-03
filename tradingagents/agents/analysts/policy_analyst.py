@@ -1,3 +1,4 @@
+from tradingagents.graph.extensions import effective_tools
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
@@ -8,17 +9,22 @@ from tradingagents.agents.utils.agent_utils import (
 from tradingagents.dataflows.config import get_config
 
 
-def create_policy_analyst(llm):
+def create_policy_analyst(llm, extension=None, instrument_context_extra=None):
     """A-stock policy analyst: tracks regulatory and industrial policy signals."""
 
     def policy_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
+        if instrument_context_extra:
+            instrument_context += "\n" + instrument_context_extra(state["company_of_interest"])
+        if extension and extension.instruction:
+            instrument_context += "\n" + extension.instruction
 
         tools = [
             get_news,
             get_global_news,
         ]
+        tools = effective_tools(tools, extension)
 
         system_message = (
             "你是一位专注于 A 股市场的政策分析师。你的核心任务是追踪和解读影响目标公司及所在行业的政策动态，评估政策对股价的潜在影响方向和力度。"
@@ -35,7 +41,7 @@ def create_policy_analyst(llm):
             "\n3. 判断政策的影响时间窗口：短期脉冲（1-2 周）vs 中期趋势（1-3 月）vs 长期结构性（半年以上）"
             "\n4. 分析政策的受益/受损逻辑链：政策 → 行业影响 → 公司业务映射 → 财务影响估算"
             "\n\n请使用以下工具："
-            "\n- `get_news(query, start_date, end_date)`：搜索与公司/行业相关的政策新闻"
+            "\n- `get_news(ticker, start_date, end_date)`：搜索与公司/行业相关的政策新闻，ticker 必须使用目标股票的 6 位代码"
             "\n- `get_global_news(curr_date, look_back_days, limit)`：获取宏观经济和政策面新闻"
             "\n\n撰写详细的政策分析报告，明确给出政策面对该公司的总体评级（重大利好/利好/中性/利空/重大利空），并量化影响程度。报告末尾附 Markdown 表格列出关键政策事件、影响方向和持续时间。"
             "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："

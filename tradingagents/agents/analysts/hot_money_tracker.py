@@ -1,9 +1,9 @@
+from tradingagents.graph.extensions import effective_tools
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_concept_blocks,
     get_dragon_tiger_board,
-    get_etf_profile,
     get_fund_flow,
     get_hot_stocks,
     get_industry_comparison,
@@ -16,16 +16,19 @@ from tradingagents.agents.utils.agent_utils import (
 from tradingagents.dataflows.config import get_config
 
 
-def create_hot_money_tracker(llm):
+def create_hot_money_tracker(llm, extension=None, instrument_context_extra=None):
     """A-stock hot money tracker: analyzes capital flow, volume anomalies, and major player movements."""
 
     def hot_money_tracker_node(state):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
+        if instrument_context_extra:
+            instrument_context += "\n" + instrument_context_extra(state["company_of_interest"])
+        if extension and extension.instruction:
+            instrument_context += "\n" + extension.instruction
 
         tools = [
             get_stock_data,
-            get_etf_profile,
             get_news,
             get_insider_transactions,
             get_hot_stocks,
@@ -35,6 +38,7 @@ def create_hot_money_tracker(llm):
             get_dragon_tiger_board,
             get_industry_comparison,
         ]
+        tools = effective_tools(tools, extension)
 
         system_message = (
             "你是一位专注于 A 股市场的游资与资金流向追踪分析师。你的核心任务是通过分析成交量异动、股东变化和市场新闻，追踪主力资金和游资的动向，判断短期资金博弈格局。"
@@ -53,7 +57,7 @@ def create_hot_money_tracker(llm):
             "\n6. 综合判断当前资金博弈格局：主力吸筹 / 主力出货 / 游资接力 / 散户主导"
             "\n\n请使用以下工具："
             "\n- `get_stock_data`：获取 K 线和成交量数据"
-            "\n- `get_news(query, start_date, end_date)`：搜索游资/资金流向相关新闻"
+            "\n- `get_news(ticker, start_date, end_date)`：搜索游资/资金流向相关新闻，ticker 必须使用目标股票的 6 位代码"
             "\n- `get_insider_transactions`：获取股东和内部人交易数据"
             "\n- `get_hot_stocks(curr_date)`：获取当日涨停股 + 题材归因 reason tags（同花顺独家）"
             "\n- `get_northbound_flow(curr_date)`：获取北向资金实时分钟级流向（沪股通+深股通累计净买入）"
@@ -69,10 +73,6 @@ def create_hot_money_tracker(llm):
             "\n4. 所属概念板块及当日板块涨幅"
             "\n5. 当日是否上榜热门股及题材归因"
             "\n6. 资金面总体判断"
-            "\n\n📌 ETF/上市基金特别规则："
-            "\n- 如果标的是 1/5 开头的 ETF/上市基金代码，必须调用 `get_etf_profile`，用 verified name 校验标的身份。"
-            "\n- ETF 资金面重点分析：场内成交量/成交额、近 20 日均量、净值/价格表现、资产配置、前十大持仓暴露、规模/份额变化（如数据源返回）、相关板块和宏观资金环境。"
-            "\n- 龙虎榜、内部人交易、大股东减持、个股主力资金等工具对 ETF 可能不适用；不可用时标注 [数据缺失/不适用]，不要据此编造游资结论。"
             + get_language_instruction()
         )
 

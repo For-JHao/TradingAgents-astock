@@ -7,19 +7,11 @@ from yfinance.exceptions import YFRateLimitError
 from stockstats import wrap
 from typing import Annotated
 import os
-import threading
 from .config import get_config
+from .resources import synchronized, atomic_csv
 from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
-_CACHE_LOCKS_GUARD = threading.Lock()
-_CACHE_LOCKS: dict[str, threading.RLock] = {}
-
-
-def _cache_lock(path: str) -> threading.RLock:
-    normalized = os.path.abspath(path)
-    with _CACHE_LOCKS_GUARD:
-        return _CACHE_LOCKS.setdefault(normalized, threading.RLock())
 
 
 def yf_retry(func, max_retries=3, base_delay=2.0):
@@ -54,6 +46,7 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+@synchronized(lambda symbol, curr_date: (get_config()["data_cache_dir"], symbol, "yfinance_ohlcv"))
 def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
@@ -80,20 +73,19 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
         f"{safe_symbol}-YFin-data-{start_str}-{end_str}.csv",
     )
 
-    with _cache_lock(data_file):
-        if os.path.exists(data_file):
-            data = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
-        else:
-            data = yf_retry(lambda: yf.download(
-                symbol,
-                start=start_str,
-                end=end_str,
-                multi_level_index=False,
-                progress=False,
-                auto_adjust=True,
-            ))
-            data = data.reset_index()
-            data.to_csv(data_file, index=False, encoding="utf-8")
+    if os.path.exists(data_file):
+        data = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
+    else:
+        data = yf_retry(lambda: yf.download(
+            symbol,
+            start=start_str,
+            end=end_str,
+            multi_level_index=False,
+            progress=False,
+            auto_adjust=True,
+        ))
+        data = data.reset_index()
+        atomic_csv(data, data_file, index=False, encoding="utf-8")
 
     data = _clean_dataframe(data)
 

@@ -1,3 +1,4 @@
+from tradingagents.graph.extensions import effective_tools
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
@@ -8,15 +9,20 @@ from tradingagents.agents.utils.agent_utils import (
 from tradingagents.dataflows.config import get_config
 
 
-def create_news_analyst(llm):
+def create_news_analyst(llm, extension=None, instrument_context_extra=None):
     def news_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
+        if instrument_context_extra:
+            instrument_context += "\n" + instrument_context_extra(state["company_of_interest"])
+        if extension and extension.instruction:
+            instrument_context += "\n" + extension.instruction
 
         tools = [
             get_news,
             get_global_news,
         ]
+        tools = effective_tools(tools, extension)
 
         system_message = (
             "你是一位专注于 A 股市场的新闻与政策分析师。你的任务是分析近期新闻动态，评估其对目标公司和 A 股市场的影响。"
@@ -26,7 +32,7 @@ def create_news_analyst(llm):
             "\n- **行业轮动**：A 股板块轮动特征明显，一个行业利好政策可能带动整个板块，分析时需关注产业链上下游联动。"
             "\n- **事件驱动**：关注财报预告/业绩快报、股东大会决议、重大合同公告、机构调研记录等公司层面事件。"
             "\n\n请使用以下工具："
-            "\n- `get_news(query, start_date, end_date)`：获取公司相关的个股新闻"
+            "\n- `get_news(ticker, start_date, end_date)`：获取公司相关的个股新闻，ticker 必须使用目标股票的 6 位代码"
             "\n- `get_global_news(curr_date, look_back_days, limit)`：获取宏观经济和市场整体新闻"
             "\n\n撰写全面的新闻分析报告，区分利好/利空/中性消息，评估影响程度和持续时间。报告末尾附 Markdown 表格汇总关键新闻事件及其影响评级。"
             "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："

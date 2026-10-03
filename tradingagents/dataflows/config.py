@@ -1,36 +1,43 @@
-from __future__ import annotations
-
-import copy
+"""Run-local vendor configuration, including ToolNode worker context."""
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Dict
+from copy import deepcopy
+from threading import Event
+from tradingagents.default_config import DEFAULT_CONFIG
 
-import tradingagents.default_config as default_config
-
-# LangGraph executes nodes and tools in context-propagating worker threads. A
-# ContextVar keeps each research job's provider, language, vendor and cache
-# settings isolated while still flowing into those child workers.
-_config: ContextVar[Dict | None] = ContextVar("tradingagents_config", default=None)
-
+_config = ContextVar("tradingagents_config", default=None)
+_tracking_failure = ContextVar("missing_data_tracking_failure", default=None)
 
 def initialize_config():
-    """Initialize the configuration with default values."""
     if _config.get() is None:
-        _config.set(copy.deepcopy(default_config.DEFAULT_CONFIG))
+        _config.set(deepcopy(DEFAULT_CONFIG))
 
+def set_config(config):
+    merged = deepcopy(DEFAULT_CONFIG)
+    merged.update(deepcopy(config))
+    _config.set(merged)
 
-def set_config(config: Dict):
-    """Set configuration for the current job execution context."""
-    current = copy.deepcopy(_config.get() or default_config.DEFAULT_CONFIG)
-    current.update(copy.deepcopy(config))
-    _config.set(current)
+def get_config():
+    return deepcopy(_config.get() or DEFAULT_CONFIG)
 
+def mark_tracking_failed():
+    flag = _tracking_failure.get()
+    if flag is not None:
+        flag.set()
 
-def get_config() -> Dict:
-    """Get the current configuration."""
-    if _config.get() is None:
-        initialize_config()
-    return copy.deepcopy(_config.get())
+def assert_tracking_healthy():
+    flag = _tracking_failure.get()
+    if flag is not None and flag.is_set():
+        raise RuntimeError("missing_data_tracking_failed")
 
-
-# Initialize with default config
-initialize_config()
+@contextmanager
+def runtime_context(config):
+    merged = deepcopy(DEFAULT_CONFIG)
+    merged.update(deepcopy(config))
+    token = _config.set(merged)
+    flag_token = _tracking_failure.set(Event())
+    try:
+        yield
+    finally:
+        _tracking_failure.reset(flag_token)
+        _config.reset(token)

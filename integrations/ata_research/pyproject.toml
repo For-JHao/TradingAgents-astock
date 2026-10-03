@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ata-research-integration"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.115.0", "uvicorn>=0.32.0", "httpx>=0.25.0,<0.26.0", "akshare>=1.16.0"]
+
+[project.scripts]
+tradingagents-research-api = "research_api.app:main"
+tradingagents-research-status = "research_api.status_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["research_api*"]
+
+[tool.ata-research]
+engine-tag = "v0.5.20"
+engine-sha = "d393981690826e46d4fb3d52e8fe7765fdc8b9cb"
+extension-contract = 1

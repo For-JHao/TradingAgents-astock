@@ -1,7 +1,7 @@
+from tradingagents.graph.extensions import effective_tools
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
-    get_etf_profile,
     get_balance_sheet,
     get_cashflow,
     get_fundamentals,
@@ -14,20 +14,24 @@ from tradingagents.agents.utils.agent_utils import (
 from tradingagents.dataflows.config import get_config
 
 
-def create_fundamentals_analyst(llm):
+def create_fundamentals_analyst(llm, extension=None, instrument_context_extra=None):
     def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
+        if instrument_context_extra:
+            instrument_context += "\n" + instrument_context_extra(state["company_of_interest"])
+        if extension and extension.instruction:
+            instrument_context += "\n" + extension.instruction
 
         tools = [
             get_fundamentals,
-            get_etf_profile,
             get_balance_sheet,
             get_cashflow,
             get_income_statement,
             get_profit_forecast,
             get_industry_comparison,
         ]
+        tools = effective_tools(tools, extension)
 
         system_message = (
             "你是一位专注于 A 股市场的基本面分析师。你的任务是全面分析目标公司的基本面信息，为投资决策提供扎实的数据支撑。"
@@ -39,7 +43,7 @@ def create_fundamentals_analyst(llm):
             "\n- **特殊风险关注**：商誉减值（并购后遗症）、股权质押比例、大股东减持计划、关联交易规模。"
             "\n\n请使用以下工具获取数据："
             "\n- `get_fundamentals`：获取公司综合基本面信息（PE/PB/总市值/季报财务快照/一致预期EPS/前向PE/PEG等）"
-            "\n- `get_profit_forecast`：获取机构一致预期EPS详情（覆盖机构数、EPS区间、前向PE、PEG、PE消化时间）"
+            "\n- `get_profit_forecast(ticker, curr_date)`：获取机构一致预期EPS详情（覆盖机构数、EPS区间、前向PE、PEG、PE消化时间）。**curr_date 必须传当前分析日期**——一致预期没有历史版本，数据层靠它判断是否在复盘历史并给出提示"
             "\n- `get_balance_sheet`：资产负债表详细数据"
             "\n- `get_cashflow`：现金流量表详细数据"
             "\n- `get_income_statement`：利润表详细数据"
@@ -53,11 +57,6 @@ def create_fundamentals_analyst(llm):
             "\n5. 资产负债率"
             "\n6. 经营性现金流与净利润比值"
             "\n7. 机构一致预期 EPS（调用 get_profit_forecast 获取）"
-            "\n\n📌 ETF/上市基金特别规则："
-            "\n- 如果标的是 1/5 开头的 6 位代码（如 562060、159915、510300），必须优先调用 `get_etf_profile(ticker, curr_date)`，并以其返回的 verified name 为唯一基金名称。"
-            "\n- ETF 不按上市公司基本面评价；不要强行套用 PE/PB、营收、净利润、ROE、资产负债表、利润表、现金流量表或 EPS。"
-            "\n- ETF 基本面报告必须改为基金画像：跟踪/主题线索、净值走势、近 1月/3月/6月/1年收益、资产配置、前十大持仓代码、规模/份额、基金经理、费率、成交活跃度、流动性风险。"
-            "\n- 如果某些 ETF 字段数据源没有返回，明确标注 [数据缺失: xxx]，不要编造。"
             + get_language_instruction()
         )
 

@@ -1,22 +1,7 @@
-FROM python:3.12-slim AS builder
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-RUN python -m venv /opt/venv
-ENV PATH=/opt/venv/bin:$PATH
-WORKDIR /build
-COPY . .
-RUN pip install --no-cache-dir .
-
 FROM python:3.12-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PATH=/opt/venv/bin:$PATH
-COPY --from=builder /opt/venv /opt/venv
-RUN useradd --create-home appuser && mkdir -p /data && chown -R appuser:appuser /data
-USER appuser
-WORKDIR /home/appuser/app
-COPY --from=builder --chown=appuser:appuser /build .
-EXPOSE 8008
-ENTRYPOINT ["tradingagents-research-api"]
+WORKDIR /research
+COPY . /research
+RUN python -c 'import tomllib; from pathlib import Path; p=[Path("pyproject.toml"),Path("integrations/ata_research/pyproject.toml")]; Path("/tmp/research-requirements.txt").write_text("\n".join(d for f in p for d in tomllib.loads(f.read_text())["project"]["dependencies"]))' && pip install --no-cache-dir -r /tmp/research-requirements.txt && pip check
+WORKDIR /research/integrations/ata_research/src
+ENV PYTHONPATH=/research ASTOCK_RESEARCH_API_HOST=0.0.0.0
+CMD ["python", "-m", "research_api.app"]

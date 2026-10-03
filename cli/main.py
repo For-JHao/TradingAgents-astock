@@ -520,6 +520,16 @@ def get_user_selections():
     )
     analysis_date = get_analysis_date()
 
+    # Step 2 (cont.): data start date → analysis look-back window (#16)
+    console.print(
+        create_question_box(
+            "Step 2b: Data Start Date",
+            "Technical analysis looks back to this date (default: first of the analysis month)",
+            analysis_date[:7] + "-01",
+        )
+    )
+    market_lookback_days = get_market_lookback_days(analysis_date)
+
     # Step 3: Output language
     console.print(
         create_question_box(
@@ -599,6 +609,7 @@ def get_user_selections():
     return {
         "ticker": selected_ticker,
         "analysis_date": analysis_date,
+        "market_lookback_days": market_lookback_days,
         "analysts": selected_analysts,
         "research_depth": selected_research_depth,
         "llm_provider": selected_llm_provider.lower(),
@@ -613,8 +624,21 @@ def get_user_selections():
 
 
 def get_ticker():
-    """Get ticker symbol from user input."""
-    return typer.prompt("", default="SPY")
+    """Get ticker symbol from user input.
+
+    Validates the ticker is safe to use as a filesystem path component before
+    returning — it is later interpolated into ``results_dir / ticker / date``
+    and the report path, so an input like ``../../tmp/evil`` would otherwise
+    write outside the intended directory (#51). Re-prompts on invalid input.
+    """
+    from tradingagents.dataflows.utils import safe_ticker_component
+
+    while True:
+        raw = typer.prompt("", default="SPY")
+        try:
+            return safe_ticker_component(raw.strip())
+        except ValueError as exc:
+            console.print(f"[red]Error: Invalid ticker — {exc}[/red]")
 
 
 def get_analysis_date():
@@ -630,6 +654,28 @@ def get_analysis_date():
                 console.print("[red]Error: Analysis date cannot be in the future[/red]")
                 continue
             return date_str
+        except ValueError:
+            console.print(
+                "[red]Error: Invalid date format. Please use YYYY-MM-DD[/red]"
+            )
+
+
+def get_market_lookback_days(analysis_date: str) -> int:
+    """Prompt for the data start date and derive the analysis look-back window (#16).
+
+    The technical analyst covers price/indicator history from this start date up
+    to the analysis date. Default start is the first day of the analysis month
+    ("monthly" view). Returns the number of days (>= 5)."""
+    analysis_dt = datetime.datetime.strptime(analysis_date, "%Y-%m-%d").date()
+    default_start = analysis_dt.replace(day=1).strftime("%Y-%m-%d")
+    while True:
+        date_str = typer.prompt("", default=default_start)
+        try:
+            start_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+            if start_dt >= analysis_dt:
+                console.print("[red]Error: start date must be before the analysis date[/red]")
+                continue
+            return max((analysis_dt - start_dt).days, 5)
         except ValueError:
             console.print(
                 "[red]Error: Invalid date format. Please use YYYY-MM-DD[/red]"
@@ -936,6 +982,7 @@ def run_analysis(checkpoint: bool = False):
     config = DEFAULT_CONFIG.copy()
     config["max_debate_rounds"] = selections["research_depth"]
     config["max_risk_discuss_rounds"] = selections["research_depth"]
+    config["market_lookback_days"] = selections.get("market_lookback_days")
     config["quick_think_llm"] = selections["shallow_thinker"]
     config["deep_think_llm"] = selections["deep_thinker"]
     config["backend_url"] = selections["backend_url"]
@@ -1185,18 +1232,58 @@ def run_analysis(checkpoint: bool = False):
             "Save path (press Enter for default)",
             default=str(default_path)
         ).strip()
-        save_path = Path(save_path_str)
+        save_path = Path(save_path_str).resolve()
+        # The save path is user-supplied and used for mkdir + file writes.
+        # Confirm before writing anywhere outside the current directory (#51).
+        proceed = True
         try:
-            report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
-            console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
-            console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
-        except Exception as e:
-            console.print(f"[red]Error saving report: {e}[/red]")
+            save_path.relative_to(Path.cwd().resolve())
+        except ValueError:
+            console.print(
+                f"[yellow]⚠ Save path is outside the current directory:[/yellow] {save_path}"
+            )
+            confirm = typer.prompt("Proceed anyway?", default="N").strip().upper()
+            proceed = confirm in ("Y", "YES")
+        if proceed:
+            try:
+                report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
+                console.print(f"\n[green]✓ Report saved to:[/green] {save_path}")
+                console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
+            except Exception as e:
+                console.print(f"[red]Error saving report: {e}[/red]")
+        else:
+            console.print("[dim]Save cancelled.[/dim]")
 
     # Prompt to display full report
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
     if display_choice in ("Y", "YES", ""):
         display_complete_report(final_state)
+
+
+@app.callback(invoke_without_command=True)
+def _default(
+    ctx: typer.Context,
+    checkpoint: bool = typer.Option(
+        False,
+        "--checkpoint",
+        help="Enable checkpoint/resume: save state after each node so a crashed run can resume.",
+    ),
+    clear_checkpoints: bool = typer.Option(
+        False,
+        "--clear-checkpoints",
+        help="Delete all saved checkpoints before running (force fresh start).",
+    ),
+):
+    """裸跑 `tradingagents`（不带子命令）＝ 直接开始分析。
+
+    ⚠️ 这个 callback 是**必须**的：Typer 在只有一个命令时用"单命令模式"，
+    裸跑就等于跑那个命令；一旦注册第二个子命令（v0.5.2 加的 `performance`），
+    它会切换成"命令组模式"，裸跑 `tradingagents` 直接报 `Missing command` 退出——
+    而 README 和所有文档写的都是裸跑。加子命令时务必保住这条默认路径。
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    analyze(checkpoint=checkpoint, clear_checkpoints=clear_checkpoints)
 
 
 @app.command()
@@ -1217,6 +1304,29 @@ def analyze(
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command()
+def performance(
+    json_out: bool = typer.Option(
+        False, "--json", help="Print raw JSON instead of the formatted report."
+    ),
+):
+    """决策绩效统计：这套流程过往的判断准不准（零 LLM 调用，只读已结算的记录）。
+
+    数据来自记忆日志：每次分析会落一条决策，下次分析同一只股票时自动拉真实行情
+    回填收益与 alpha。**这不是回测**，详见报告末尾的说明。
+    """
+    import json as _json
+
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+    from tradingagents.performance import format_report, summarize
+
+    summary = summarize(TradingMemoryLog(DEFAULT_CONFIG).load_entries())
+    if json_out:
+        console.print_json(_json.dumps(summary, ensure_ascii=False))
+        return
+    console.print(Markdown(format_report(summary)))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 from tradingagents.graph.reflection import Reflector
-from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.graph.trading_graph import (
+    TradingAgentsGraph,
+    _normalize_yfinance_ticker,
+)
 from tradingagents.graph.propagation import Propagator
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 
@@ -385,6 +388,25 @@ class TestTradingMemoryLogCore:
 
 class TestDeferredReflection:
 
+    # Yahoo Finance ticker normalization
+
+    def test_normalize_yfinance_ticker_adds_mainland_exchange_suffix(self):
+        assert _normalize_yfinance_ticker("600519") == "600519.SS"
+        assert _normalize_yfinance_ticker("000001") == "000001.SZ"
+        assert _normalize_yfinance_ticker("688017") == "688017.SS"
+
+    def test_normalize_yfinance_ticker_preserves_qualified_symbols(self):
+        assert _normalize_yfinance_ticker("600519.SS") == "600519.SS"
+        assert _normalize_yfinance_ticker("600519.SH") == "600519.SS"
+        assert _normalize_yfinance_ticker("SH600519") == "600519.SS"
+        assert _normalize_yfinance_ticker("NVDA") == "NVDA"
+
+    def test_normalize_yfinance_ticker_does_not_invent_beijing_suffix(self):
+        assert _normalize_yfinance_ticker("830799") == "830799"
+        assert _normalize_yfinance_ticker("920002") == "920002"
+        assert _normalize_yfinance_ticker("BJ830799") == "830799"
+        assert _normalize_yfinance_ticker("830799.BJ") == "830799"
+
     # update_with_outcome
 
     def test_update_replaces_pending_tag(self, tmp_path):
@@ -499,6 +521,16 @@ class TestDeferredReflection:
         assert raw is not None and alpha is not None and days is not None
         assert isinstance(raw, float) and isinstance(alpha, float) and isinstance(days, int)
         assert days == 5
+
+    def test_fetch_returns_uses_exchange_qualified_astock_symbol(self):
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            m = MagicMock()
+            m.history.return_value = _price_df([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+            mock_ticker_cls.return_value = m
+            TradingAgentsGraph._fetch_returns(mock_graph, "600519", "2026-01-05")
+
+        assert mock_ticker_cls.call_args_list[0].args == ("600519.SS",)
 
     def test_fetch_returns_too_recent(self):
         """Only 1 data point available → returns (None, None, None), no crash."""
@@ -616,7 +648,6 @@ class TestPortfolioManagerInjection:
             rating=PortfolioRating.OVERWEIGHT,
             executive_summary="Build position gradually over the next two weeks.",
             investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
-            price_target=215.0,
             time_horizon="3-6 months",
         )
         llm = _structured_pm_llm(captured, decision)
@@ -626,7 +657,8 @@ class TestPortfolioManagerInjection:
         assert "**Rating**: Overweight" in md
         assert "**Executive Summary**: Build position gradually" in md
         assert "**Investment Thesis**: AI capex cycle" in md
-        assert "**Price Target**: 215.0" in md
+        # 框架不产出目标价——渲染里永远不该出现这一节。
+        assert "Price Target" not in md
         assert "**Time Horizon**: 3-6 months" in md
 
     def test_pm_falls_back_to_freetext_when_structured_unavailable(self):
@@ -756,6 +788,7 @@ class TestLegacyRemoval:
         mock_graph.memory_log = TradingMemoryLog({"memory_log_path": str(tmp_path / "mem.md")})
         mock_graph.log_states_dict = {}
         mock_graph.debug = False
+        mock_graph._checkpointer_ctx = None
         mock_graph.config = {"results_dir": str(tmp_path)}
         mock_graph.graph.invoke.return_value = fake_state
         mock_graph.propagator.create_initial_state.return_value = fake_state
@@ -765,6 +798,15 @@ class TestLegacyRemoval:
         # the actual write path instead of the auto-MagicMock.
         mock_graph._run_graph = functools.partial(
             TradingAgentsGraph._run_graph, mock_graph
+        )
+        mock_graph.prepare_graph_run = functools.partial(
+            TradingAgentsGraph.prepare_graph_run, mock_graph
+        )
+        mock_graph.finalize_graph_run = functools.partial(
+            TradingAgentsGraph.finalize_graph_run, mock_graph
+        )
+        mock_graph.close_graph_run = functools.partial(
+            TradingAgentsGraph.close_graph_run, mock_graph
         )
         TradingAgentsGraph.propagate(mock_graph, "NVDA", "2026-01-10")
         entries = mock_graph.memory_log.load_entries()

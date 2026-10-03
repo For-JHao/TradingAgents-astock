@@ -1,13 +1,6 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
-
-if [[ ! -x ".venv/bin/tradingagents-research-api" ]]; then
-  echo "未找到虚拟环境或 API 命令，请先执行："
-  echo "  python3 -m venv .venv && source .venv/bin/activate && pip install -e ."
-  exit 1
-fi
-
-exec ".venv/bin/tradingagents-research-api" "$@"
+#!/bin/sh
+set -eu
+RESEARCH_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$RESEARCH_ROOT/integrations/ata_research/src"
+export PYTHONPATH="$RESEARCH_ROOT"
+exec "$RESEARCH_ROOT/.venv/bin/python" -m research_api.app

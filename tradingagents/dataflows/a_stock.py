@@ -1,13 +1,12 @@
 """A-stock (China mainland) data vendor for TradingAgents.
 
-Most sources are direct HTTP APIs or mootdx TCP. AKShare is used only as an
-optional ETF/listed-fund enrichment source when installed.
+Zero third-party data dependency (no akshare). All sources are direct HTTP APIs
+or mootdx TCP.
 
 Data sources:
 - mootdx (TCP 7709): OHLCV K-lines, financial snapshots, F10 text
 - Tencent Finance (HTTP GBK): PE/PB/market cap/turnover
 - 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup
-- 东方财富 push2his (direct HTTP): ETF/stock historical K-lines fallback
 - 新浪财经 (direct HTTP): K-line fallback, financial statements
 - 同花顺 (direct HTTP): consensus EPS, hot stocks, northbound capital flow
 - 财联社 (direct HTTP): global news wire
@@ -15,51 +14,33 @@ Data sources:
 
 from __future__ import annotations
 
+from tradingagents.safe_errors import safe_error
+
 from typing import Annotated
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
+import contextlib
+import io
 import json as _json
 import os
 import logging
 import math
 import random
 import re as _re
-import threading
+import socket
 import time
 import uuid
 import urllib.request
-import contextlib
-import functools
-import io
 
 import pandas as pd
 import requests as _requests
 
 from .utils import safe_ticker_component
 
+from .resources import synchronized, atomic_csv, eastmoney_budget
+from .config import get_config
+
 logger = logging.getLogger(__name__)
-_CACHE_LOCKS_GUARD = threading.Lock()
-_CACHE_LOCKS: dict[str, threading.RLock] = {}
-_NAME_CODE_LOCK = threading.RLock()
-_ETF_CACHE_LOCK = threading.RLock()
-
-
-def _cache_lock(path: str) -> threading.RLock:
-    normalized = os.path.abspath(path)
-    with _CACHE_LOCKS_GUARD:
-        return _CACHE_LOCKS.setdefault(normalized, threading.RLock())
-
-
-def _serialized(lock: threading.RLock):
-    def decorate(function):
-        @functools.wraps(function)
-        def wrapped(*args, **kwargs):
-            with lock:
-                return function(*args, **kwargs)
-
-        return wrapped
-
-    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -67,28 +48,59 @@ def _serialized(lock: threading.RLock):
 # ---------------------------------------------------------------------------
 
 def _get_prefix(code: str) -> str:
-    """6-digit A-stock code -> market prefix for Tencent API."""
-    if code.startswith(("5", "6", "9")):
+    """6-digit A-stock code -> market prefix for Tencent API.
+
+    The 92 prefix must be checked before the leading-9 rule: the Beijing Stock
+    Exchange started issuing 920xxx codes for new listings in October 2024, and
+    a bare ``startswith("9")`` routes them to Shanghai, where the Tencent quote
+    endpoint returns an empty payload (issue #85).  Only 900xxx (Shanghai B
+    shares) legitimately belongs to ``sh``.
+    """
+    if code.startswith("92"):
+        return "bj"
+    if code.startswith(("6", "9")):
         return "sh"
     elif code.startswith("8"):
         return "bj"
     return "sz"
 
 
-def _eastmoney_market_id(code: str) -> int:
-    """6-digit security code -> Eastmoney secid market id."""
-    return 1 if code.startswith(("5", "6", "9")) else 0
+def _reject_non_a_share(original: str, code: str) -> None:
+    """港股/美股代码走到 A 股数据层时当场报错，而不是拿去查 A 股（#43）。
 
-
-def _is_etf_like_code(code: str) -> bool:
-    """Best-effort A-share listed fund/ETF code detection."""
-    return code.startswith(("1", "5"))
+    A 股代码恒为 6 位数字。港股是 4~5 位（`00700`）或带 `.HK` 后缀，美股是字母。
+    这些代码此前会被**原样放行**，然后拿去问 mootdx / 腾讯 / 东财——而这些源对
+    不存在的代码往往不报错，只返回空值或僵尸报价（北交所 920 号段就踩过，见
+    `_normalize_ticker` 上游的 `_get_prefix`）。于是模型会拿着一份看起来正常、
+    实际属于别的市场或根本不存在的数据写完整篇报告，报告里完全看不出来。
+    """
+    if code.isdigit() and len(code) == 6:
+        return
+    upper = original.strip().upper()
+    if upper.endswith(".HK") or (code.isdigit() and len(code) in (4, 5)):
+        raise ValueError(
+            f"'{original}' 是港股代码。本数据层只支持 A 股（6 位数字代码，"
+            f"如 600519 / 000001）。港股数据请用姊妹项目 global-stock-data，"
+            f"多 Agent 港股分析仍在 roadmap（issue #43）。"
+        )
+    if code and not code.isdigit():
+        raise ValueError(
+            f"'{original}' 不是 A 股代码。本数据层只支持 A 股 6 位数字代码"
+            f"（如 600519）；美股/港股请用姊妹项目 global-stock-data。"
+        )
+    raise ValueError(
+        f"'{original}' 不是有效的 A 股代码：A 股代码恒为 6 位数字（如 600519），"
+        f"这里解析出的是 '{code}'。"
+    )
 
 
 def _normalize_ticker(symbol: str) -> str:
     """Strip exchange prefix/suffix, return pure 6-digit code.
 
     Handles: '688017', 'SH688017', '688017.SH', 'sh688017'
+
+    非 A 股代码（港股 `00700` / `0700.HK`、美股 `AAPL`）会直接报错，不再原样
+    放行去查 A 股数据源（#43）。
     """
     s = symbol.strip().upper()
     # Remove .SH / .SZ / .BJ suffix
@@ -101,7 +113,9 @@ def _normalize_ticker(symbol: str) -> str:
         if s.startswith(prefix):
             s = s[len(prefix) :]
             break
-    return safe_ticker_component(s)
+    code = safe_ticker_component(s)
+    _reject_non_a_share(symbol, code)
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -112,31 +126,35 @@ _name_to_code: dict[str, str] | None = None
 _code_to_name: dict[str, str] | None = None
 
 
-@_serialized(_NAME_CODE_LOCK)
+@synchronized("mootdx")
 def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
     """Build name→code and code→name maps via mootdx (both SH & SZ markets)."""
     global _name_to_code, _code_to_name
     if _name_to_code is not None:
         return _name_to_code, _code_to_name
 
-    from mootdx.quotes import Quotes
-
-    client = Quotes.factory(market="std")
     n2c: dict[str, str] = {}
     c2n: dict[str, str] = {}
 
-    for market in (0, 1):  # 0=SZ, 1=SH
-        stocks = client.stocks(market=market)
-        if stocks is None or stocks.empty:
-            continue
-        for _, row in stocks.iterrows():
-            code = str(row["code"]).strip()
-            name = str(row["name"]).strip()
-            if not _re.match(r"^[01356]\d{5}$", code):
+    try:
+        for market in (0, 1):  # 0=SZ, 1=SH
+            stocks = _mootdx_call("stocks", market=market)
+            if stocks is None or stocks.empty:
                 continue
-            clean_name = name.replace(" ", "").replace("　", "")
-            n2c[clean_name] = code
-            c2n[code] = clean_name
+            for _, row in stocks.iterrows():
+                code = str(row["code"]).strip()
+                name = str(row["name"]).strip()
+                if not _re.match(r"^[036]\d{5}$", code):
+                    continue
+                clean_name = name.replace(" ", "").replace("　", "")
+                n2c[clean_name] = code
+                c2n[code] = clean_name
+    except Exception as e:
+        # 网络抖动/通达信不可达时给出明确提示，而非冒泡成风马牛不相及的报错（#46/#66）
+        raise ValueError(
+            "无法通过 mootdx 解析股票名称（通达信服务暂时不可达）：%s。"
+            "请稍后重试，或直接输入 6 位股票代码。" % e
+        ) from e
 
     _name_to_code = n2c
     _code_to_name = c2n
@@ -173,7 +191,57 @@ def resolve_ticker(user_input: str) -> str:
         examples = ", ".join(f"{n}({c})" for n, c in list(matches.items())[:5])
         raise ValueError(f"'{s}' 匹配到多只股票: {examples}，请输入完整名称或代码")
 
-    raise ValueError(f"找不到股票 '{s}'，请检查名称是否正确")
+    # LLM 有时会把行业/概念名（如 '游戏'、'白酒'）当 ticker 传进来（#76）。
+    # 报错必须写明原因和正确用法，让模型能在下一次工具调用中自我纠正。
+    raise ValueError(
+        f"找不到股票 '{s}'。ticker 参数只接受 6 位股票代码（如 '600519'）"
+        f"或完整股票名称（如 '贵州茅台'）；行业/概念/板块名（如 '游戏'）不是"
+        f"有效的股票标识。请改用目标个股的 6 位股票代码重试。"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 未来函数防护（point-in-time）
+# ---------------------------------------------------------------------------
+
+
+# A 股市场时区。判"今天"必须按市场所在地算，不能用主机本地时区——
+# 主机在 UTC+9 以东（如新西兰 UTC+13）时，当地已过零点而上海还在前一天，
+# 当天的分析会被判成"复盘历史"：实时资金流被略去、快照工具打出莫须有的未来函数
+# 警告。反过来主机在西半球也会把已经过去的交易日当成"今天"。
+_MARKET_TZ = timezone(timedelta(hours=8))
+
+
+def _market_today() -> "date":
+    """A 股市场当前日期（Asia/Shanghai），与主机时区无关。"""
+    return datetime.now(_MARKET_TZ).date()
+
+
+def _is_historical(curr_date) -> bool:
+    """分析日期是否早于市场当天。早于 = 这次是在复盘历史，不能拿实时数据当事实。"""
+    if not curr_date:
+        return False
+    try:
+        return (
+            datetime.strptime(str(curr_date)[:10], "%Y-%m-%d").date()
+            < _market_today()
+        )
+    except ValueError:
+        return False
+
+
+def _snapshot_notice(curr_date: str, what: str) -> str:
+    """实时快照被用在历史日期上时，在正文顶部明说。
+
+    有些数据源只提供"此刻"的值（腾讯实时行情、同花顺当前一致预期），拿不到
+    某个历史日的原值。既然补不上，就必须**说出来**——否则模型会把今天的估值
+    当成分析日当天的事实写进报告，而这种污染在报告里完全看不出来。
+    """
+    return (
+        f"⚠️ 未来函数警告：以下{what}是**此刻的实时快照**，不是 {curr_date} 当天的值。"
+        f"本数据源不提供历史时点数据。在复盘历史日期时，**不得**把这些数字当作"
+        f"{curr_date} 当天已知的事实，也不要据此推断当时的判断。\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,24 +249,245 @@ def resolve_ticker(user_input: str) -> str:
 # ---------------------------------------------------------------------------
 
 _mootdx_client = None
-_MOOTDX_LOCK = threading.RLock()
+
+# 实测可用的通达信备选服务器（按延迟排序，2026-06 验证）。用于规避 mootdx
+# 0.11.x 全新安装时 BESTIP.HQ 为空串导致的 `ValueError: not enough values to unpack`。
+_TDX_SERVERS = [
+    ("119.97.185.59", 7709), ("124.70.133.119", 7709), ("116.205.183.150", 7709),
+    ("123.60.73.44", 7709), ("116.205.163.254", 7709), ("121.36.225.169", 7709),
+    ("123.60.70.228", 7709), ("124.71.9.153", 7709), ("110.41.147.114", 7709),
+    ("124.71.187.122", 7709),
+]
 
 
+# 探测用的探针股票：主板老票，任何通达信服务器都应能返回它的日线。
+_TDX_CANARY_SYMBOL = "600519"
+
+# 全部服务器都验不过之后，隔多久才允许再探一轮（秒）。没有这个负缓存，
+# 每一次取数都会把整张服务器表重探一遍（10 台 × TCP 超时），把"取不到数"
+# 放大成"每个请求卡几十秒"。
+_MOOTDX_RETRY_AFTER_S = 300.0
+_mootdx_unavailable_until = 0.0
+
+# ⚠️ 曾经加过「连续 N 台协议失败就停手」的提前退出，已移除：三台远端拒绝**证明不了**
+# 本地网络封了协议，而列表里靠后的服务器完全可能是好的。提前收手会让那台可用服务器
+# 永远试不到，还顺手记下 5 分钟负缓存。省下的十几秒不值得换这个风险——真正的耗时
+# 大头是 bestip 全表测速，那个已经单独规避了。
+
+
+def _candidate_tdx_servers() -> list[tuple[str, int]]:
+    """待试的通达信服务器：先用实测精选的 `_TDX_SERVERS`，再补 mootdx 自带的完整主机表。
+
+    只试精选的那 10 台是不够的——它们要是恰好都不可用，而 mootdx 自带表里还有活着的
+    主机，就会被判成"全网不可达"并记 5 分钟负缓存。这里把两张表合起来去重后逐台验证，
+    覆盖面等同 `bestip`，但不做它那套要跑几分钟的全表测速。
+    """
+    servers = list(_TDX_SERVERS)
+    seen = set(servers)
+    try:
+        from mootdx.consts import HQ_HOSTS
+        for entry in HQ_HOSTS:
+            # 形如 ("深圳双线主站1", "110.41.147.114", 7709)
+            host = (entry[1], entry[2]) if len(entry) >= 3 else None
+            if host and host not in seen:
+                seen.add(host)
+                servers.append(host)
+    except Exception as e:  # mootdx 版本变动导致取不到就只用精选表，不影响主流程
+        logger.debug("读取 mootdx HQ_HOSTS 失败，仅使用内置精选表：%s", safe_error(e))
+    return servers
+
+
+def _reachable_tdx_servers(servers, timeout: float = 2.0):
+    """并发做 TCP 预筛，返回可连的那些（保持原顺序）。
+
+    只是把"等超时"这件事并行化，不改变优先级：返回顺序仍是候选表顺序，所以实测
+    精选的服务器依旧排在前面、依旧第一个被真实验证。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not servers:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(servers))) as pool:
+        flags = list(pool.map(lambda s: _probe_tdx(s[0], s[1], timeout), servers))
+    return [srv for srv, ok in zip(servers, flags) if ok]
+
+
+def _probe_tdx(ip: str, port: int, timeout: float = 2.0) -> bool:
+    """TCP 握手探测通达信服务器端口是否开着。
+
+    ⚠️ 只是**廉价预筛**，通过不代表能取到数：实测存在大量"TCP 三次握手成功、
+    通达信协议握手立刻被 RST"的服务器。选服务器必须再走 `_tdx_client_works()`
+    做一次真实取数验证（#90）。
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _tdx_client_works(client) -> bool:
+    """真实拉一根 K 线来验证这个 client 确实能取数。"""
+    try:
+        df = client.bars(symbol=_TDX_CANARY_SYMBOL, category=4, offset=1)
+        return df is not None and not df.empty
+    except Exception:
+        return False
+
+
+@synchronized("mootdx")
+def reset_mootdx_client() -> None:
+    """丢弃缓存的 client，让下一次调用重新选服务器。
+
+    单例一旦钉在一台"当时能用、后来挂了"的服务器上，之后每次取数都失败降级且
+    永远不会重选。数据调用发现 mootdx 出错时调它，下一次就能换一台（#90）。
+    """
+    global _mootdx_client, _mootdx_unavailable_until
+    _mootdx_client = None
+    _mootdx_unavailable_until = 0.0
+
+
+@contextlib.contextmanager
+def _preserve_mootdx_bestip():
+    """探测期间保护 mootdx 的持久化服务器配置，退出时按需还原。
+
+    `StdQuotes.__init__` 里有 `config.set('BESTIP', {'HQ': self.server})`——**每建一次
+    带 server 的 client 都会写进 mootdx 的配置文件**。逐台探测 38 个候选就等于把用户
+    原本配好的服务器一路覆写，最后留下的是最后一台**失败的**服务器，还会连累同一台
+    机器上其它用 mootdx 的程序。
+
+    🔴 必须先 `setup()` 再快照：新进程里 `config.get("BESTIP")` 返回的是模块默认空值，
+    用户持久化的值要等 `BaseQuotes.__init__` 调 `setup()` 才读进来。快照到空值的话，
+    "还原"反而会把真实配置抹成空——比不还原更糟。
+    实测（mootdx 0.11.7）：setup 前 `{'HQ': ''}`，setup 后 `{'HQ': ['218.6.x.x', 7709]}`。
+
+    用法：`with _preserve_mootdx_bestip() as keep:` —— 选出可用服务器时调 `keep()`
+    表示"这次的覆写是我们想要的，别还原"；不调就在退出时还原。
+
+    ⚠️ **做成上下文管理器而不是手动调还原函数**：此前是在两处分别调 `_restore_bestip()`，
+    再加一条提前返回就会漏掉一处，而漏掉的后果是静默留下一台死服务器。
+    """
+    saved = None
+    try:
+        from mootdx import config as _cfg
+        _cfg.setup()
+        saved = _cfg.get("BESTIP")
+        if isinstance(saved, dict):
+            saved = dict(saved)
+    except Exception as e:  # 版本差异导致取不到就跳过保护，别影响主流程
+        logger.debug("读取 mootdx BESTIP 失败，本次探测不做保护：%s", safe_error(e))
+
+    keep = {"flag": False}
+    try:
+        yield lambda: keep.__setitem__("flag", True)
+    finally:
+        if saved is not None and not keep["flag"]:
+            try:
+                from mootdx import config as _cfg2
+                _cfg2.set("BESTIP", saved)
+            except Exception as e:
+                logger.debug("恢复 mootdx BESTIP 失败：%s", safe_error(e))
+
+
+@synchronized("mootdx")
 def _get_mootdx_client():
-    """Lazy-init mootdx Quotes client (TCP connection, reusable)."""
-    global _mootdx_client
-    with _MOOTDX_LOCK:
-        if _mootdx_client is None:
-            from mootdx.quotes import Quotes
+    """Lazy-init 健壮版 mootdx Quotes client（TCP 连接，可复用）。
 
-            _mootdx_client = Quotes.factory(market="std")
+    选服务器的顺序：内置服务器表（TCP 预筛 + 真实取数验证）→ bestip 测速 →
+    裸 factory（老用户 config 里已有 IP）。每一级都必须真正取到数据才会被采用，
+    避免把 client 钉死在一台"端口开着但协议不通"的服务器上（#90）。
+    全部失败时抛 RuntimeError，并在 `_MOOTDX_RETRY_AFTER_S` 内直接快速失败，
+    不再逐台重探。
+    """
+    global _mootdx_client, _mootdx_unavailable_until
+    if _mootdx_client is not None:
         return _mootdx_client
 
+    now = time.time()
+    if now < _mootdx_unavailable_until:
+        raise RuntimeError(
+            "mootdx 通达信服务器暂不可用（%.0f 秒内不再重试）。"
+            "已尝试全部内置服务器：端口能连上的也没能完成通达信协议取数。"
+            "请检查网络环境（代理/防火墙/公司网络常拦 TCP 7709），"
+            "或改用 6 位股票代码直接查询。" % (_mootdx_unavailable_until - now)
+        )
 
-def _mootdx_call(method: str, *args, **kwargs):
-    """Serialize access to mootdx's reusable TCP client."""
-    with _MOOTDX_LOCK:
-        return getattr(_get_mootdx_client(), method)(*args, **kwargs)
+    from mootdx.quotes import Quotes
+
+    tcp_ok_but_dead = 0
+    # 探测会覆写 mootdx 的持久化配置——包在这里，只有真选出可用服务器时才 keep()，
+    # 其余每条退出路径（含异常）都自动还原。
+    with _preserve_mootdx_bestip() as keep_bestip:
+        # TCP 预筛并发跑：38 台里多数是"连都连不上"，串行每台要等满超时（实测整轮
+        # 73.7s，首次调用像卡死）。预筛纯粹是等 IO，并发不改变选取语义——下面仍按
+        # 原顺序、逐台做真实取数验证，精选表依旧优先。
+        reachable = _reachable_tdx_servers(_candidate_tdx_servers())
+
+        for ip, port in reachable:
+            # 「TCP 通但通达信协议不通」有两种表现：factory 建连时握手就被拒，
+            # 或者建出来了但取不到数。**两种都要算**——只统计后者的话，计数永远是 0
+            # （实测这批服务器全是在 factory 里抛 ConnectionReset），下面的快速失败
+            # 判断就失效了。
+            try:
+                candidate = Quotes.factory(market="std", server=(ip, port))
+            except Exception as e:
+                tcp_ok_but_dead += 1
+                logger.debug("mootdx %s:%s 握手失败（%s），换下一台", ip, port, type(e).__name__)
+            else:
+                if _tdx_client_works(candidate):
+                    logger.info("mootdx server selected: %s:%s", ip, port)
+                    keep_bestip()   # 这次的覆写正是我们想要的，别还原
+                    _mootdx_client = candidate
+                    return _mootdx_client
+                tcp_ok_but_dead += 1
+                logger.debug("mootdx %s:%s 建连成功但取不到数，换下一台", ip, port)
+
+    # 走到这里说明逐台探测都没成——上面的 with 已经把 BESTIP 还原成用户原本的配置，
+    # 下面的裸 factory 读的正是它，这个兜底才有意义。
+    # ⚠️ 刻意**不用** `bestip=True`：它会把整张主机表做一遍测速，实测要几分钟。
+    # `_candidate_tdx_servers()` 已经把 mootdx 自带的完整主机表逐台验证过了，
+    # 覆盖面不比 bestip 差，而且每台都是"真取到数才算通过"。
+    try:
+        candidate = Quotes.factory(market="std")
+    except Exception as e:
+        logger.debug("mootdx 裸 factory 失败 — %s", safe_error(e))
+    else:
+        if _tdx_client_works(candidate):
+            logger.info("mootdx client from 裸 factory（用户已有配置）")
+            _mootdx_client = candidate
+            return _mootdx_client
+
+    _mootdx_unavailable_until = time.time() + _MOOTDX_RETRY_AFTER_S
+    if tcp_ok_but_dead:
+        # 说清楚是"协议被拒"而不是"连不上"——这两者的排查方向完全不同。
+        cause = (
+            "%d 台服务器端口能连上，但通达信协议握手/取数被拒。"
+            "这通常是协议层被拦（代理、防火墙、公司网络对 TCP 7709 的策略），"
+            "换服务器解决不了。" % tcp_ok_but_dead
+        )
+    else:
+        cause = "内置服务器表里没有一台的 TCP 7709 能连上，请检查网络连通性。"
+    raise RuntimeError(
+        "mootdx 通达信服务器不可用：%s"
+        "可改用 6 位股票代码直接查询。%.0f 秒内将直接快速失败、不再逐台重探。"
+        % (cause, _MOOTDX_RETRY_AFTER_S)
+    )
+
+
+@synchronized("mootdx")
+def _mootdx_call(method: str, **kwargs):
+    """调用 mootdx 的某个方法，失败就弃用当前服务器。
+
+    选中的服务器随时可能挂掉；不弃用的话单例会一直指着它，之后每次取数都失败降级
+    且永不重选（#90 的「反复降级」）。取 client 本身失败时不清缓存——那条路径已经
+    在 `_get_mootdx_client` 里做了负缓存，清掉等于取消快速失败。
+    """
+    client = _get_mootdx_client()
+    try:
+        return getattr(client, method)(**kwargs)
+    except Exception:
+        reset_mootdx_client()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -265,64 +554,9 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 # 不限流（实测不封 IP 或风控极弱）。批量任务可调大 EM_MIN_INTERVAL 进一步降速。
 _EM_SESSION = _requests.Session()
 _EM_SESSION.headers.update({"User-Agent": _UA})
-_EM_LOCK = threading.RLock()
 # 两次东财请求最小间隔(秒)；批量多 Agent 场景可设环境变量 EM_MIN_INTERVAL=1.5~2 降速。
 _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
-
-
-# ETF enrichment caches. Multi-agent research can ask for the same ETF profile
-# from several analysts; without caching, AKShare's full ETF list endpoint is
-# repeatedly hit and may return 429/rate-limit errors.
-_VERIFIED_ETF_NAMES = {
-    "562060": "标普A股红利ETF华宝",
-}
-_ETF_NAME_CACHE: dict[str, str] = {}
-_ETF_PROFILE_CACHE: dict[tuple[str, str], str] = {}
-_AK_ETF_SPOT_DF_CACHE: dict[str, object] = {"ts": 0.0, "df": None}
-_AK_ETF_KLINE_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
-_AK_ETF_SPOT_TTL_SECONDS = float(os.environ.get("AK_ETF_SPOT_TTL_SECONDS", "3600"))
-_AK_ETF_SPOT_BACKOFF_SECONDS = float(
-    os.environ.get("AK_ETF_SPOT_BACKOFF_SECONDS", "1800")
-)
-_AK_ETF_SPOT_BACKOFF_UNTIL = [0.0]
-
-
-def _is_rate_limited_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in ("429", "too many requests", "rate limit", "rate-limited", "rate limited")
-    )
-
-
-def _brief_http_error(exc: Exception) -> str:
-    text = str(exc)
-    return text if len(text) <= 240 else text[:237] + "..."
-
-
-def _response_json_or_empty(resp: _requests.Response) -> dict:
-    """Parse JSON defensively for public endpoints that sometimes return HTML."""
-    try:
-        resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"HTTP {resp.status_code}: {_brief_http_error(exc)}") from exc
-
-    text = resp.text.strip()
-    if not text:
-        raise RuntimeError(f"empty response, content-type={resp.headers.get('content-type', '')}")
-    content_type = resp.headers.get("content-type", "").lower()
-    if "json" not in content_type and not text.startswith(("{", "[")):
-        preview = text[:80].replace("\n", " ")
-        raise RuntimeError(
-            f"non-JSON response, status={resp.status_code}, "
-            f"content-type={content_type}, preview={preview!r}"
-        )
-    try:
-        return resp.json()
-    except ValueError as exc:
-        preview = text[:80].replace("\n", " ")
-        raise RuntimeError(f"invalid JSON response, preview={preview!r}") from exc
 
 
 def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
@@ -332,16 +566,8 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     串行限流：与上次东财请求间隔 < EM_MIN_INTERVAL 时 sleep 补足 + 0.1~0.5s 随机抖动。
     传入的 headers 会覆盖 session 默认 UA（用于保留各端点自己的 Referer/Origin）。
     """
-    with _EM_LOCK:
-        wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-        if wait > 0:
-            time.sleep(wait + random.uniform(0.1, 0.5))
-        try:
-            return _EM_SESSION.get(
-                url, params=params, headers=headers, timeout=timeout, **kwargs
-            )
-        finally:
-            _em_last_call[0] = time.time()
+    with eastmoney_budget(_EM_MIN_INTERVAL):
+        return _EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
 
 
 def _eastmoney_datacenter(
@@ -388,7 +614,7 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
     }
     r = _requests.get(url, headers=headers, timeout=15)
     r.encoding = "gbk"
-    dfs = pd.read_html(r.text)
+    dfs = pd.read_html(io.StringIO(r.text))
     # Find the table containing EPS data
     for df in dfs:
         cols = [str(c) for c in df.columns]
@@ -408,7 +634,7 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
 
     Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
     """
-    prefix = _get_prefix(code)
+    prefix = "sh" if code.startswith("6") else "sz"
     url = (
         "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
         "CN_MarketData.getKLineData"
@@ -448,618 +674,73 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
     return df
 
 
-def _eastmoney_kline_fallback(
-    code: str, start_date: str = None, end_date: str = None
-) -> pd.DataFrame:
-    """Fetch daily K-line from Eastmoney push2his.
-
-    This endpoint covers both A-shares and listed funds/ETFs, so it is a better
-    fallback for 5xxxxx/1xxxxx ETF codes than mootdx or Sina.
-    """
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "secid": f"{_eastmoney_market_id(code)}.{code}",
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": "101",
-        "fqt": "1",
-        "beg": (start_date or "19900101").replace("-", ""),
-        "end": (end_date or "20500101").replace("-", ""),
-    }
-    r = _em_get(url, params=params, timeout=15)
-    r.raise_for_status()
-    klines = (r.json().get("data") or {}).get("klines") or []
-    if not klines:
-        return pd.DataFrame()
-
-    rows = []
-    for line in klines:
-        parts = str(line).split(",")
-        if len(parts) < 6:
-            continue
-        rows.append(
-            {
-                "Date": parts[0],
-                "Open": float(parts[1]),
-                "Close": float(parts[2]),
-                "High": float(parts[3]),
-                "Low": float(parts[4]),
-                "Volume": int(float(parts[5])),
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df["Date"] = pd.to_datetime(df["Date"])
-    return df
-
-
-def _eastmoney_security_snapshot(code: str) -> dict:
-    """Fetch a broad Eastmoney quote snapshot for stocks and listed funds."""
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
-    params = {
-        "fltt": "2",
-        "invt": "2",
-        "fields": ",".join(
-            [
-                "f43",  # latest price
-                "f44",  # high
-                "f45",  # low
-                "f46",  # open
-                "f47",  # volume
-                "f48",  # amount
-                "f57",  # code
-                "f58",  # name
-                "f60",  # previous close
-                "f116",  # total market cap / fund market value where available
-                "f117",  # float market cap
-                "f127",  # industry/category
-                "f168",  # turnover rate
-                "f169",  # change
-                "f170",  # change pct
-            ]
-        ),
-        "secid": f"{_eastmoney_market_id(code)}.{code}",
-    }
-    r = _em_get(url, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json().get("data") or {}
-
-
-def _extract_js_var(text: str, name: str) -> str | None:
-    match = _re.search(rf"var\s+{_re.escape(name)}\s*=\s*(.*?);", text, _re.S)
-    if not match:
+def _last_ohlcv_date(df: pd.DataFrame) -> pd.Timestamp | None:
+    """Return the latest OHLCV Date in a normalized dataframe."""
+    if df is None or df.empty or "Date" not in df.columns:
         return None
-    return match.group(1).strip()
+    dates = pd.to_datetime(df["Date"], errors="coerce")
+    if dates.dropna().empty:
+        return None
+    return dates.max().normalize()
 
 
-def _parse_js_json_var(text: str, name: str, default=None):
-    raw = _extract_js_var(text, name)
-    if raw is None:
-        return default
+def _normalize_ohlcv_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OHLCV Date values to daily granularity."""
+    if df is None or df.empty or "Date" not in df.columns:
+        return df
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    return df.dropna(subset=["Date"])
+
+
+def _needs_sina_supplement(df: pd.DataFrame, target_date: str | None) -> bool:
+    """True when mootdx/cache data is older than the requested cutoff date."""
+    if not target_date:
+        return False
+    last_date = _last_ohlcv_date(df)
+    if last_date is None:
+        return True
+    target = pd.to_datetime(target_date).normalize()
+    return last_date < target
+
+
+def _merge_ohlcv(primary: pd.DataFrame, supplement: pd.DataFrame) -> pd.DataFrame:
+    """Merge OHLCV frames, preferring supplement rows on duplicate dates."""
+    frames = [frame for frame in (primary, supplement) if frame is not None and not frame.empty]
+    if not frames:
+        return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    combined = pd.concat(frames, ignore_index=True)
+    combined = _normalize_ohlcv_dates(combined)
+    combined = combined.drop_duplicates(subset=["Date"], keep="last")
+    combined = combined.sort_values("Date").reset_index(drop=True)
+    return combined
+
+
+def _supplement_stale_ohlcv_with_sina(
+    code: str,
+    df: pd.DataFrame,
+    target_date: str | None,
+    start_date: str | None = None,
+) -> tuple[pd.DataFrame, bool]:
+    """Use Sina daily K-line to fill dates missing from mootdx/cache data."""
+    if not _needs_sina_supplement(df, target_date):
+        return df, False
     try:
-        return _json.loads(raw)
-    except Exception:
-        return default
-
-
-def _parse_js_string_var(text: str, name: str) -> str:
-    raw = _extract_js_var(text, name)
-    if raw is None:
-        return ""
-    try:
-        value = _json.loads(raw)
-        return "" if value is None else str(value)
-    except Exception:
-        return raw.strip().strip('"').strip("'")
-
-
-def _eastmoney_fund_script(code: str) -> str:
-    """Fetch Eastmoney fund profile script for ETF/open fund metadata."""
-    url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js"
-    headers = {
-        "User-Agent": _UA,
-        "Referer": "https://fund.eastmoney.com/",
-    }
-    r = _requests.get(url, headers=headers, timeout=15)
-    r.raise_for_status()
-    return r.text
-
-
-def _akshare_etf_spot(code: str) -> dict:
-    """Fetch ETF spot row from AKShare when the optional dependency is available."""
-    now = time.time()
-    if now < _AK_ETF_SPOT_BACKOFF_UNTIL[0]:
-        wait_left = int(_AK_ETF_SPOT_BACKOFF_UNTIL[0] - now)
-        raise RuntimeError(f"AKShare ETF spot is cooling down after rate limit ({wait_left}s left)")
-
-    try:
-        import akshare as ak
-    except Exception as exc:
-        raise RuntimeError("AKShare is not installed") from exc
-
-    cached_df = _AK_ETF_SPOT_DF_CACHE.get("df")
-    cached_ts = float(_AK_ETF_SPOT_DF_CACHE.get("ts") or 0.0)
-    if isinstance(cached_df, pd.DataFrame) and now - cached_ts < _AK_ETF_SPOT_TTL_SECONDS:
-        df = cached_df
-    else:
-        try:
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                df = ak.fund_etf_spot_em()
-        except Exception as exc:
-            if _is_rate_limited_error(exc):
-                _AK_ETF_SPOT_BACKOFF_UNTIL[0] = time.time() + _AK_ETF_SPOT_BACKOFF_SECONDS
-            raise
-        _AK_ETF_SPOT_DF_CACHE["df"] = df
-        _AK_ETF_SPOT_DF_CACHE["ts"] = time.time()
-
-    if df is None or df.empty:
-        return {}
-    code_col = "代码" if "代码" in df.columns else None
-    if not code_col:
-        return {}
-    matched = df[df[code_col].astype(str).str.zfill(6) == code]
-    if matched.empty:
-        return {}
-    row = matched.iloc[0].to_dict()
-    return {str(k): v for k, v in row.items()}
-
-
-def _akshare_etf_kline(
-    code: str, start_date: str = None, end_date: str = None
-) -> pd.DataFrame:
-    """Fetch ETF daily K-line through AKShare fund_etf_hist_em."""
-    cache_key = (
-        code,
-        start_date or "1990-01-01",
-        end_date or "2050-01-01",
-    )
-    cached = _AK_ETF_KLINE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached.copy()
-
-    try:
-        import akshare as ak
-    except Exception as exc:
-        raise RuntimeError("AKShare is not installed") from exc
-
-    try:
-        df = ak.fund_etf_hist_em(
-            symbol=code,
-            period="daily",
-            start_date=(start_date or "1990-01-01").replace("-", ""),
-            end_date=(end_date or "2050-01-01").replace("-", ""),
-            adjust="qfq",
-        )
-    except Exception as exc:
-        if _is_rate_limited_error(exc):
-            _AK_ETF_SPOT_BACKOFF_UNTIL[0] = time.time() + _AK_ETF_SPOT_BACKOFF_SECONDS
-        raise
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    rename_candidates = {
-        "日期": "Date",
-        "开盘": "Open",
-        "收盘": "Close",
-        "最高": "High",
-        "最低": "Low",
-        "成交量": "Volume",
-        "成交额": "Amount",
-    }
-    df = df.rename(columns={k: v for k, v in rename_candidates.items() if k in df.columns})
-    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    if not all(col in df.columns for col in required):
-        return pd.DataFrame()
-    df = df[required]
-    df["Date"] = pd.to_datetime(df["Date"])
-    for col in ["Open", "High", "Low", "Close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
-    result = df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
-    _AK_ETF_KLINE_CACHE[cache_key] = result.copy()
-    return result
-
-
-@_serialized(_ETF_CACHE_LOCK)
-def get_etf_verified_name(code: str) -> str:
-    """Return verified ETF/listed fund name from trusted public sources."""
-    normalized = _normalize_ticker(code)
-    if not _is_etf_like_code(normalized):
-        return ""
-    if normalized in _ETF_NAME_CACHE:
-        return _ETF_NAME_CACHE[normalized]
-    if normalized in _VERIFIED_ETF_NAMES:
-        _ETF_NAME_CACHE[normalized] = _VERIFIED_ETF_NAMES[normalized]
-        return _ETF_NAME_CACHE[normalized]
-
-    try:
-        row = _akshare_etf_spot(normalized)
-        name = str(row.get("名称") or "").strip()
-        if name:
-            _ETF_NAME_CACHE[normalized] = name
-            return name
+        sina_df = _sina_kline_fallback(code, start_date, target_date)
     except Exception as e:
-        logger.warning("AKShare ETF name failed for %s: %s", normalized, e)
-    try:
-        name = _parse_js_string_var(_eastmoney_fund_script(normalized), "fS_name")
-        if name:
-            _ETF_NAME_CACHE[normalized] = name
-            return name
-    except Exception as e:
-        logger.warning("eastmoney ETF fund name failed for %s: %s", normalized, e)
-    try:
-        snapshot = _eastmoney_security_snapshot(normalized)
-        name = str(snapshot.get("f58") or "")
-        if name:
-            _ETF_NAME_CACHE[normalized] = name
-        return name
-    except Exception:
-        return ""
-
-
-def _format_latest_net_worth(items: list[dict]) -> list[str]:
-    if not items:
-        return []
-    latest = items[-1]
-    lines = ["--- Net Value / Price Proxy Trend (Eastmoney fund page) ---"]
-    timestamp = latest.get("x")
-    if timestamp:
-        try:
-            date_text = datetime.fromtimestamp(int(timestamp) / 1000).strftime("%Y-%m-%d")
-        except Exception:
-            date_text = str(timestamp)
-        lines.append(f"Latest NAV Date: {date_text}")
-    for key, label in {
-        "y": "Latest Unit NAV",
-        "equityReturn": "Daily NAV Return (%)",
-        "unitMoney": "Distribution per Unit",
-    }.items():
-        value = latest.get(key)
-        if value not in (None, "", "-"):
-            lines.append(f"{label}: {value}")
-    if len(items) >= 20:
-        try:
-            first = float(items[-20].get("y"))
-            last = float(items[-1].get("y"))
-            if first:
-                lines.append(f"20-point NAV Return: {(last / first - 1) * 100:.2f}%")
-        except Exception:
-            pass
-    return lines
-
-
-def _format_asset_allocation(items) -> list[str]:
-    if not items:
-        return []
-    lines = ["--- Asset Allocation ---"]
-    if isinstance(items, dict) and isinstance(items.get("series"), list):
-        categories = items.get("categories") or []
-        if categories:
-            lines.append(f"Allocation Date: {categories[-1]}")
-        for series in items["series"]:
-            if not isinstance(series, dict):
-                continue
-            name = series.get("name")
-            data = series.get("data") or []
-            if name and data:
-                lines.append(f"{name}: {data[-1]}")
-        return lines
-    latest = items[-1] if isinstance(items, list) else items
-    if isinstance(latest, dict):
-        date_text = latest.get("date") or latest.get("x") or latest.get("FSRQ")
-        if date_text:
-            lines.append(f"Allocation Date: {date_text}")
-        for key, label in {
-            "gp": "Stock Position (%)",
-            "zq": "Bond Position (%)",
-            "xj": "Cash Position (%)",
-            "jz": "Net Asset Value",
-        }.items():
-            value = latest.get(key)
-            if value not in (None, "", "-"):
-                lines.append(f"{label}: {value}")
-    return lines
-
-
-def _format_top_holdings(script_text: str) -> list[str]:
-    holdings = _parse_js_json_var(script_text, "stockCodesNew", []) or []
-    if not holdings:
-        holdings = _parse_js_json_var(script_text, "stockCodes", []) or []
-    if not holdings:
-        return []
-    codes = []
-    for item in holdings[:10]:
-        raw = str(item)
-        code = raw.split(".")[-1][-6:]
-        if _re.fullmatch(r"\d{6}", code):
-            codes.append(code)
-    if not codes:
-        return []
-
-    names = {}
-    try:
-        quotes = _tencent_quote(codes)
-        names = {code: data.get("name") for code, data in quotes.items()}
-    except Exception as e:
-        logger.warning("ETF holding names failed: %s", e)
-
-    lines = ["--- Top Holding Codes (latest public fund page) ---"]
-    for idx, code in enumerate(codes, start=1):
-        name = names.get(code)
-        lines.append(f"{idx}. {code}" + (f" {name}" if name else ""))
-    return lines
-
-
-@_serialized(_ETF_CACHE_LOCK)
-def get_etf_profile(
-    ticker: Annotated[str, "ETF/listed fund code"],
-    curr_date: Annotated[str, "current date"] = None,
-) -> str:
-    """Get ETF-specific profile, NAV trend, holdings, scale and liquidity data."""
-    code = _normalize_ticker(ticker)
-    if not _is_etf_like_code(code):
-        return f"{code} is not detected as a listed ETF/fund code."
-
-    profile_date = curr_date or datetime.now().strftime("%Y-%m-%d")
-    profile_key = (code, profile_date)
-    if profile_key in _ETF_PROFILE_CACHE:
-        return _ETF_PROFILE_CACHE[profile_key]
-
-    lines = []
-    script_text = ""
-    akshare_name = ""
-    verified_name = _VERIFIED_ETF_NAMES.get(code) or _ETF_NAME_CACHE.get(code) or ""
-    if verified_name:
-        lines.extend(
-            [
-                f"Name: {verified_name}",
-                f"Code: {code}",
-                "Security Type: Listed ETF / fund",
-                "Identity Rule: Verified from trusted ETF metadata cache; do not infer the name from memory.",
-            ]
-        )
-
-    try:
-        spot = _akshare_etf_spot(code)
-        if spot:
-            akshare_name = str(spot.get("名称") or "").strip()
-            if akshare_name:
-                _ETF_NAME_CACHE[code] = akshare_name
-            if not any(line.startswith("Name:") for line in lines):
-                lines.extend(
-                    [
-                        f"Name: {akshare_name or code}",
-                        f"Code: {code}",
-                        "Security Type: Listed ETF / fund",
-                        "Identity Rule: Verified from AKShare fund_etf_spot_em; do not infer the name from memory.",
-                    ]
-                )
-            elif akshare_name and verified_name and akshare_name != verified_name:
-                lines.append(f"AKShare Name Cross-check: {akshare_name}")
-            lines.append("--- AKShare ETF Spot ---")
-            for key in ["最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "开盘价", "最高价", "最低价", "昨收"]:
-                value = spot.get(key)
-                if value not in (None, "", "-"):
-                    lines.append(f"AKShare {key}: {value}")
-    except Exception as e:
-        logger.warning("AKShare ETF spot failed for %s: %s", code, e)
-
-    try:
-        script_text = _eastmoney_fund_script(code)
-        name = _parse_js_string_var(script_text, "fS_name") or code
-        if not any(line.startswith("Name:") for line in lines):
-            lines.extend(
-                [
-                    f"Name: {name}",
-                    f"Code: {code}",
-                    "Security Type: Listed ETF / fund",
-                    "Identity Rule: Verified from Eastmoney fund page; do not infer the name from memory.",
-                ]
-            )
-        elif name and akshare_name and name != akshare_name:
-            lines.append(f"Eastmoney Name Cross-check: {name}")
-        for var_name, label in {
-            "syl_1y": "1-Month Return (%)",
-            "syl_3y": "3-Month Return (%)",
-            "syl_6y": "6-Month Return (%)",
-            "syl_1n": "1-Year Return (%)",
-            "fund_sourceRate": "Original Fee Rate",
-            "fund_Rate": "Current Fee Rate",
-            "fund_minsg": "Minimum Subscription",
-        }.items():
-            value = _parse_js_string_var(script_text, var_name)
-            if value:
-                lines.append(f"{label}: {value}")
-
-        lines.extend(_format_latest_net_worth(_parse_js_json_var(script_text, "Data_netWorthTrend", []) or []))
-        lines.extend(_format_asset_allocation(_parse_js_json_var(script_text, "Data_assetAllocation", []) or []))
-        lines.extend(_format_top_holdings(script_text))
-
-        scale = _parse_js_json_var(script_text, "Data_fluctuationScale", []) or []
-        if scale:
-            lines.append("--- Fund Scale / Shares ---")
-            if isinstance(scale, dict) and isinstance(scale.get("series"), list):
-                categories = scale.get("categories") or []
-                latest_index = len(categories) - 1 if categories else -1
-                if latest_index >= 0:
-                    lines.append(f"Scale Date: {categories[latest_index]}")
-                for series in scale["series"]:
-                    if not isinstance(series, dict):
-                        continue
-                    value = series.get("y")
-                    mom = series.get("mom")
-                    if value not in (None, "", "-"):
-                        suffix = f", QoQ/MoM: {mom}" if mom not in (None, "", "-") else ""
-                        lines.append(f"Scale: {value}{suffix}")
-            elif isinstance(scale, list) and scale:
-                latest_scale = scale[-1]
-                if isinstance(latest_scale, dict):
-                    for key, value in latest_scale.items():
-                        if value not in (None, "", "-"):
-                            lines.append(f"{key}: {value}")
-            elif isinstance(scale, dict):
-                for key, value in scale.items():
-                    if value not in (None, "", "-"):
-                        lines.append(f"{key}: {value}")
-
-        managers = _parse_js_json_var(script_text, "Data_currentFundManager", []) or []
-        if managers:
-            lines.append("--- Fund Manager ---")
-            for manager in managers[:3]:
-                if isinstance(manager, dict):
-                    name = manager.get("name") or manager.get("Name")
-                    work_time = manager.get("workTime") or manager.get("WorkTime")
-                    if name:
-                        lines.append(f"{name}" + (f" ({work_time})" if work_time else ""))
-    except Exception as e:
-        logger.warning("eastmoney fund page failed for %s: %s", code, e)
-
-    try:
-        snapshot = _eastmoney_security_snapshot(code)
-        if snapshot:
-            if not any(line.startswith("Name:") for line in lines):
-                lines.extend(
-                    [
-                        f"Name: {snapshot.get('f58') or code}",
-                        f"Code: {code}",
-                        "Security Type: Listed ETF / fund",
-                    ]
-                )
-            lines.append("--- Exchange Trading Snapshot ---")
-            for field, label in {
-                "f43": "Latest Price",
-                "f169": "Price Change",
-                "f170": "Price Change Percent (%)",
-                "f60": "Previous Close",
-                "f46": "Open",
-                "f44": "High",
-                "f45": "Low",
-                "f47": "Volume",
-                "f48": "Amount",
-                "f168": "Turnover Rate (%)",
-            }.items():
-                value = snapshot.get(field)
-                if value not in (None, "", "-"):
-                    lines.append(f"{label}: {value}")
-    except Exception as e:
-        logger.warning("eastmoney ETF snapshot failed for %s: %s", code, e)
-
-    try:
-        end_date = curr_date or datetime.now().strftime("%Y-%m-%d")
-        start_date = (
-            pd.to_datetime(end_date) - pd.Timedelta(days=45)
-        ).strftime("%Y-%m-%d")
-        kline, kline_source = _load_kline_with_fallbacks(code, start_date, end_date)
-        if not kline.empty:
-            recent = kline.tail(20).copy()
-            latest = recent.iloc[-1]
-            first_close = float(recent.iloc[0]["Close"])
-            latest_close = float(latest["Close"])
-            period_return = (
-                (latest_close / first_close - 1) * 100 if first_close else 0
-            )
-            lines.extend(
-                [
-                    "--- Exchange Liquidity / Momentum ---",
-                    f"K-line Source: {kline_source}",
-                    f"Latest Trading Date: {latest['Date'].strftime('%Y-%m-%d')}",
-                    f"Latest Close: {latest_close:.3f}",
-                    f"20-bar Price Return: {period_return:.2f}%",
-                    f"20-bar Average Volume: {recent['Volume'].mean():.0f}",
-                ]
-            )
-    except Exception as e:
-        logger.info("ETF recent momentum unavailable for %s: %s", code, _brief_http_error(e))
-
-    if not lines:
-        result = f"No ETF profile data found for {code}"
-        _ETF_PROFILE_CACHE[profile_key] = result
-        return result
-
-    header = f"# ETF Analysis Data for {code}\n"
-    header += "# Data source: AKShare fund_etf_spot_em/fund_etf_hist_em + eastmoney fund page/push2his\n"
-    header += (
-        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    )
-    result = header + "\n".join(lines)
-    _ETF_PROFILE_CACHE[profile_key] = result
-    return result
-
-
-def _get_etf_profile(code: str, curr_date: str = None) -> str:
-    """Return ETF/listed fund profile data using quote-style public endpoints."""
-    return get_etf_profile(code, curr_date)
-
-
-def _load_kline_with_fallbacks(
-    code: str, start_date: str = None, end_date: str = None
-) -> tuple[pd.DataFrame, str]:
-    """Load daily K-line from mootdx, then AKShare/Eastmoney, then Sina."""
-    try:
-        df = _mootdx_call("bars", symbol=code, category=4, offset=800)
-
-        if df is None or df.empty:
-            raise ValueError(f"No data from mootdx for {code}")
-
-        df = df.drop(
-            columns=["datetime", "year", "month", "day", "hour", "minute"],
-            errors="ignore",
-        )
-        df = df.reset_index()
-        df = df.rename(
-            columns={
-                "datetime": "Date",
-                "open": "Open",
-                "close": "Close",
-                "high": "High",
-                "low": "Low",
-                "volume": "Volume",
-                "amount": "Amount",
-            }
-        )
-        df["Date"] = pd.to_datetime(df["Date"])
-        return df, "mootdx (TCP)"
-    except Exception as e:
-        logger.info("mootdx K-line unavailable for %s: %s, trying HTTP fallbacks", code, _brief_http_error(e))
-
-    if _is_etf_like_code(code):
-        try:
-            df = _akshare_etf_kline(code, start_date, end_date)
-            if not df.empty:
-                return df, "AKShare fund_etf_hist_em (fallback)"
-        except Exception as e:
-            logger.info("AKShare ETF K-line unavailable for %s: %s, trying eastmoney HTTP fallback", code, _brief_http_error(e))
-
-    skip_eastmoney_kline = os.getenv("ASTOCK_SKIP_EASTMONEY_KLINE", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    if not skip_eastmoney_kline:
-        try:
-            df = _eastmoney_kline_fallback(code, start_date, end_date)
-            if not df.empty:
-                return df, "eastmoney push2his (fallback)"
-        except Exception as e:
-            logger.info("eastmoney K-line unavailable for %s: %s, trying sina HTTP fallback", code, _brief_http_error(e))
-
-    try:
-        df = _sina_kline_fallback(code, start_date, end_date)
-        if not df.empty:
-            return df, "sina HTTP (fallback)"
-    except Exception as e:
-        logger.warning("sina K-line failed for %s: %s", code, _brief_http_error(e))
-
-    return pd.DataFrame(), ""
+        logger.warning("sina K-line supplement failed for %s: %s", code, safe_error(e))
+        return df, False
+    if sina_df.empty:
+        return df, False
+    merged = _merge_ohlcv(df, sina_df)
+    return merged, _last_ohlcv_date(merged) != _last_ohlcv_date(df)
 
 
 # ---------------------------------------------------------------------------
 # OHLCV loading with cache (mootdx -> CSV)
 # ---------------------------------------------------------------------------
 
+@synchronized(lambda symbol, curr_date: (get_config()["data_cache_dir"], _normalize_ticker(symbol), "astock_ohlcv"))
 def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV via mootdx, cache to CSV, filter by curr_date.
 
@@ -1077,23 +758,59 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
 
     cache_file = os.path.join(cache_dir, f"{code}-astock-daily.csv")
 
-    with _cache_lock(cache_file):
-        if os.path.exists(cache_file):
-            mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
-            if mtime.date() == datetime.now().date():
-                data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
-                data["Date"] = pd.to_datetime(data["Date"])
-                cutoff = pd.to_datetime(curr_date)
-                return data[data["Date"] <= cutoff]
+    if os.path.exists(cache_file):
+        mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
+        if mtime.date() == datetime.now().date():
+            data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
+            data = _normalize_ohlcv_dates(data)
+            data, supplemented = _supplement_stale_ohlcv_with_sina(
+                code, data, curr_date, start_date=None
+            )
+            if supplemented:
+                atomic_csv(data, cache_file, index=False, encoding="utf-8")
+            cutoff = pd.to_datetime(curr_date)
+            return data[data["Date"] <= cutoff]
 
-        df, _ = _load_kline_with_fallbacks(code)
-        if df.empty:
-            raise ValueError(f"No OHLCV data from mootdx/eastmoney/sina for {code}")
+    # Fetch from mootdx — 800 daily bars (~3 years of trading days)
+    try:
+        df = _mootdx_call("bars", symbol=code, category=4, offset=800)
+
+        if df is None or df.empty:
+            raise ValueError(f"No OHLCV data from mootdx for {code}")
+
+        # mootdx returns index named 'datetime' AND a column named 'datetime'
+        # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
+        df = df.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
+        df = df.reset_index()  # moves index 'datetime' → column 'datetime'
+        rename_map = {
+            "datetime": "Date",
+            "open": "Open",
+            "close": "Close",
+            "high": "High",
+            "low": "Low",
+            "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
         df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-        df.to_csv(cache_file, index=False, encoding="utf-8")
+        df = _normalize_ohlcv_dates(df)
+    except Exception as e:
+        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, safe_error(e))
+        # Fallback: Sina direct HTTP API
+        try:
+            df = _sina_kline_fallback(code)
+            if df.empty:
+                raise ValueError(f"No OHLCV data from sina for {code}")
+        except Exception:
+            raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
 
-        cutoff = pd.to_datetime(curr_date)
-        return df[df["Date"] <= cutoff]
+    df, _ = _supplement_stale_ohlcv_with_sina(code, df, curr_date, start_date=None)
+
+    # Cache to disk
+    atomic_csv(df, cache_file, index=False, encoding="utf-8")
+
+    # Filter by curr_date to prevent look-ahead bias
+    cutoff = pd.to_datetime(curr_date)
+    return df[df["Date"] <= cutoff]
 
 
 # ===========================================================================
@@ -1112,9 +829,46 @@ def get_stock_data(
     """Get OHLCV stock price data via mootdx."""
     code = _normalize_ticker(symbol)
 
-    df, data_source = _load_kline_with_fallbacks(code, start_date, end_date)
-    if df.empty:
-        return "K线数据获取失败：mootdx、东方财富和新浪备用源均不可用，请检查网络连接"
+    data_source = "mootdx (TCP)"
+    try:
+        df = _mootdx_call("bars", symbol=code, category=4, offset=800)
+
+        if df is None or df.empty:
+            raise ValueError(f"No data from mootdx for {code}")
+
+        # Drop duplicate datetime column + extra columns before reset_index
+        df = df.drop(
+            columns=["datetime", "year", "month", "day", "hour", "minute"],
+            errors="ignore",
+        )
+        df = df.reset_index()  # index 'datetime' → column 'datetime'
+        df = df.rename(
+            columns={
+                "datetime": "Date",
+                "open": "Open",
+                "close": "Close",
+                "high": "High",
+                "low": "Low",
+                "volume": "Volume",
+                "amount": "Amount",
+            }
+        )
+        df = _normalize_ohlcv_dates(df)
+
+    except Exception as e:
+        logger.warning("mootdx K-line failed for %s: %s, trying sina HTTP fallback", code, safe_error(e))
+        # Fallback: Sina direct HTTP API
+        try:
+            df = _sina_kline_fallback(code, start_date, end_date)
+            if df.empty:
+                return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
+            data_source = "sina HTTP (fallback)"
+        except Exception:
+            return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
+
+    df, supplemented = _supplement_stale_ohlcv_with_sina(code, df, end_date, start_date)
+    if supplemented:
+        data_source = f"{data_source} + sina HTTP supplement"
 
     # Filter by date range
     start_dt = pd.to_datetime(start_date)
@@ -1222,7 +976,7 @@ def get_indicators(
         return result
 
     except Exception as e:
-        return f"Error calculating {indicator} for {code}: {str(e)}"
+        return f"Error calculating {indicator} for {code}: {safe_error(e)}"
 
 
 # ---- 3. get_fundamentals ----
@@ -1234,11 +988,13 @@ def get_fundamentals(
 ) -> str:
     """Get company fundamentals from Tencent + mootdx + Eastmoney + 同花顺."""
     code = _normalize_ticker(ticker)
-    if _is_etf_like_code(code):
-        return _get_etf_profile(code, curr_date)
 
     try:
         lines = []
+        # 腾讯行情只有"此刻"的 PE/PB/市值，拿不到历史时点值。复盘历史日期时
+        # 必须明说，否则模型会把今天的估值写成分析日当天的事实（未来函数）。
+        if _is_historical(curr_date):
+            lines.append(_snapshot_notice(curr_date, "估值与行情数据"))
 
         # --- Tencent: real-time valuation ---
         try:
@@ -1261,7 +1017,7 @@ def get_fundamentals(
                     ]
                 )
         except Exception as e:
-            logger.warning("Tencent quote failed for %s: %s", code, e)
+            logger.warning("Tencent quote failed for %s: %s", code, safe_error(e))
 
         # --- mootdx: financial snapshot (quarterly) ---
         try:
@@ -1286,7 +1042,7 @@ def get_fundamentals(
                         if val is not None and str(val) != "nan":
                             lines.append(f"{label}: {val}")
         except Exception as e:
-            logger.warning("mootdx finance failed for %s: %s", code, e)
+            logger.warning("mootdx finance failed for %s: %s", code, safe_error(e))
 
         # --- Eastmoney push2: basic stock info (direct HTTP) ---
         try:
@@ -1314,7 +1070,7 @@ def get_fundamentals(
                 if d.get("f189"):
                     lines.append(f"上市日期: {d['f189']}")
         except Exception as e:
-            logger.warning("eastmoney push2 stock info failed for %s: %s", code, e)
+            logger.warning("eastmoney push2 stock info failed for %s: %s", code, safe_error(e))
 
         # --- 同花顺 direct HTTP: consensus EPS forecast ---
         try:
@@ -1384,9 +1140,9 @@ def get_fundamentals(
                                         f"PEG not applicable"
                                     )
                 except Exception as e:
-                    logger.warning("Forward PE calc failed for %s: %s", code, e)
+                    logger.warning("Forward PE calc failed for %s: %s", code, safe_error(e))
         except Exception as e:
-            logger.warning("Consensus EPS forecast failed for %s: %s", code, e)
+            logger.warning("Consensus EPS forecast failed for %s: %s", code, safe_error(e))
 
         if not lines:
             return f"No fundamentals data found for A-stock '{code}'"
@@ -1399,7 +1155,7 @@ def get_fundamentals(
         return header + "\n".join(lines)
 
     except Exception as e:
-        return f"Error retrieving fundamentals for {code}: {str(e)}"
+        return f"Error retrieving fundamentals for {code}: {safe_error(e)}"
 
 
 # ---- 4. get_balance_sheet ----
@@ -1483,7 +1239,7 @@ def get_balance_sheet(
         return header + csv_string
 
     except Exception as e:
-        return f"Error retrieving balance sheet for {code}: {str(e)}"
+        return f"Error retrieving balance sheet for {code}: {safe_error(e)}"
 
 
 # ---- 5. get_cashflow ----
@@ -1514,7 +1270,7 @@ def get_cashflow(
         return header + csv_string
 
     except Exception as e:
-        return f"Error retrieving cash flow for {code}: {str(e)}"
+        return f"Error retrieving cash flow for {code}: {safe_error(e)}"
 
 
 # ---- 6. get_income_statement ----
@@ -1545,7 +1301,7 @@ def get_income_statement(
         return header + csv_string
 
     except Exception as e:
-        return f"Error retrieving income statement for {code}: {str(e)}"
+        return f"Error retrieving income statement for {code}: {safe_error(e)}"
 
 
 # ---- 7. get_news ----
@@ -1605,7 +1361,7 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
 
 def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
     """Sina Finance stock news API (backup source)."""
-    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+    prefix = _get_prefix(code)
     url = (
         f"https://vip.stock.finance.sina.com.cn/corp/view/"
         f"vCB_AllNewsStock.php?symbol={prefix}{code}&Page=1"
@@ -1658,14 +1414,14 @@ def get_news(
         articles = _fetch_news_eastmoney(code)
         source_label = "东方财富"
     except Exception as e:
-        logger.warning("East Money news fetch failed for %s: %s", code, e)
+        logger.warning("East Money news fetch failed for %s: %s", code, safe_error(e))
 
     if not articles:
         try:
             articles = _fetch_news_sina(code)
             source_label = "新浪财经"
         except Exception as e:
-            logger.warning("Sina news fetch failed for %s: %s", code, e)
+            logger.warning("Sina news fetch failed for %s: %s", code, safe_error(e))
 
     if not articles:
         return f"No news found for A-stock '{code}'"
@@ -1729,7 +1485,7 @@ def get_global_news(
         cls_params = {"rn": str(limit), "page": "1"}
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
         r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
-        d_cls = _response_json_or_empty(r_cls)
+        d_cls = r_cls.json()
         for item in d_cls.get("data", {}).get("roll_data", []):
             title = item.get("title", "") or item.get("brief", "")
             content = item.get("content", "") or item.get("brief", "")
@@ -1748,7 +1504,7 @@ def get_global_news(
                 "source": "CLS Wire",
             })
     except Exception as e:
-        logger.info("CLS news unavailable: %s", _brief_http_error(e))
+        logger.warning("CLS news fetch failed: %s", safe_error(e))
 
     # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
     try:
@@ -1763,7 +1519,7 @@ def get_global_news(
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
         r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
-        d_em = _response_json_or_empty(r_em)
+        d_em = r_em.json()
         for item in d_em.get("data", {}).get("fastNewsList", []):
             title = item.get("title", "")
             summary = item.get("summary", "")[:200]
@@ -1775,7 +1531,7 @@ def get_global_news(
                 "source": "Eastmoney Global",
             })
     except Exception as e:
-        logger.info("Eastmoney global news unavailable: %s", _brief_http_error(e))
+        logger.warning("Eastmoney global news fetch failed: %s", safe_error(e))
 
     if not all_news:
         return f"No global news found for {curr_date}"
@@ -1851,7 +1607,7 @@ def get_insider_transactions(
         return header + text
 
     except Exception as e:
-        return f"Error retrieving insider/shareholder data for {code}: {str(e)}"
+        return f"Error retrieving insider/shareholder data for {code}: {safe_error(e)}"
 
 
 # ---- 10. get_profit_forecast ----
@@ -1859,7 +1615,7 @@ def get_insider_transactions(
 
 def get_profit_forecast(
     ticker: Annotated[str, "A-stock code"],
-    curr_date: Annotated[str, "current date (unused, for interface compat)"] = None,
+    curr_date: Annotated[str, "current date — 用于判断是否在复盘历史"] = None,
 ) -> str:
     """Get consensus EPS forecasts with forward valuation (同花顺 direct HTTP)."""
     code = _normalize_ticker(ticker)
@@ -1876,6 +1632,9 @@ def get_profit_forecast(
             f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
         ]
+        # 一致预期是"当前"的分析师预测，没有历史时点版本。同上，必须明说。
+        if _is_historical(curr_date):
+            lines.insert(0, _snapshot_notice(curr_date, "分析师一致预期"))
 
         eps_by_year = {}
         for _, row in df.iterrows():
@@ -1939,12 +1698,12 @@ def get_profit_forecast(
                                 f"PEG not applicable"
                             )
         except Exception as e:
-            logger.warning("Forward PE calc failed for %s: %s", code, e)
+            logger.warning("Forward PE calc failed for %s: %s", code, safe_error(e))
 
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error retrieving profit forecast for {code}: {str(e)}"
+        return f"Error retrieving profit forecast for {code}: {safe_error(e)}"
 
 
 # ---- 11. get_hot_stocks ----
@@ -2026,7 +1785,7 @@ def get_hot_stocks(
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error fetching hot stocks for {curr_date}: {str(e)}"
+        return f"Error fetching hot stocks for {curr_date}: {safe_error(e)}"
 
 
 # ---- 12. get_northbound_flow ----
@@ -2044,48 +1803,46 @@ def _northbound_cache_path() -> str:
     return os.path.join(cache_dir, "northbound_daily.csv")
 
 
+@synchronized(lambda *args, **kwargs: _northbound_cache_path())
 def _save_northbound_snapshot(date_str: str, hgt: float, sgt: float) -> None:
     """Append today's northbound close to local CSV cache (dedup by date)."""
     import csv
 
     path = _northbound_cache_path()
-    with _cache_lock(path):
-        existing: dict[str, tuple[str, str]] = {}
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None)
-                for row in reader:
-                    if len(row) >= 3:
-                        existing[row[0]] = (row[1], row[2])
-        existing[date_str] = (f"{hgt:.2f}", f"{sgt:.2f}")
-        sorted_dates = sorted(existing.keys())
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["date", "hgt", "sgt"])
-            for d in sorted_dates:
-                writer.writerow([d, existing[d][0], existing[d][1]])
-
-
-def _load_northbound_history(n: int = 20) -> list[tuple[str, float, float]]:
-    """Load last N days of northbound close data from local cache."""
-    import csv
-
-    path = _northbound_cache_path()
-    with _cache_lock(path):
-        if not os.path.exists(path):
-            return []
-        rows: list[tuple[str, float, float]] = []
+    existing: dict[str, tuple[str, str]] = {}
+    if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             reader = csv.reader(f)
             next(reader, None)
             for row in reader:
                 if len(row) >= 3:
-                    try:
-                        rows.append((row[0], float(row[1]), float(row[2])))
-                    except ValueError:
-                        continue
-        return rows[-n:]
+                    existing[row[0]] = (row[1], row[2])
+    existing[date_str] = (f"{hgt:.2f}", f"{sgt:.2f}")
+    sorted_dates = sorted(existing.keys())
+    frame = pd.DataFrame([[d, existing[d][0], existing[d][1]] for d in sorted_dates], columns=["date", "hgt", "sgt"])
+    atomic_csv(frame, path, index=False, encoding="utf-8")
+
+
+
+@synchronized(lambda *args, **kwargs: _northbound_cache_path())
+def _load_northbound_history(n: int = 20) -> list[tuple[str, float, float]]:
+    """Load last N days of northbound close data from local cache."""
+    import csv
+
+    path = _northbound_cache_path()
+    if not os.path.exists(path):
+        return []
+    rows: list[tuple[str, float, float]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if len(row) >= 3:
+                try:
+                    rows.append((row[0], float(row[1]), float(row[2])))
+                except ValueError:
+                    continue
+    return rows[-n:]
 
 
 def get_northbound_flow(
@@ -2187,7 +1944,7 @@ def get_northbound_flow(
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error fetching northbound flow: {str(e)}"
+        return f"Error fetching northbound flow: {safe_error(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -2222,12 +1979,12 @@ def get_concept_blocks(
     code = _normalize_ticker(ticker)
 
     try:
-        url = (
-            "https://finance.pae.baidu.com/api/getrelatedblock"
-            f'?stock=[{{"code":"{code}","market":"ab","type":"stock"}}]'
-            "&finClientType=pc"
-        )
-        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10)
+        url = "https://finance.pae.baidu.com/api/getrelatedblock"
+        params = {
+            "stock": f'[{{"code":"{code}","market":"ab","type":"stock"}}]',
+            "finClientType": "pc",
+        }
+        r = requests.get(url, params=params, headers=_BAIDU_PAE_HEADERS, timeout=10)
         d = r.json()
 
         if str(d.get("ResultCode", -1)) != "0":
@@ -2237,6 +1994,16 @@ def get_concept_blocks(
             )
 
         result = d.get("Result", {})
+        # 百度风控会回 HTTP 403 + {"ResultCode": 0(整数), "Result": {"code": 403,
+        # "isCaptchaEnabled": true, "msg": "hit risk"}}。外层 ResultCode 是**整数** 0，
+        # 上面那句 str() 比较放它过关，于是被风控当成"该股没有概念板块"——一个错的事实
+        # 喂给模型。这里必须单独识别，把失败如实报出来。
+        if isinstance(result, dict) and result.get("code") == 403:
+            return (
+                f"Baidu PAE 风控拦截（hit risk），{code} 的概念板块本次取不到。"
+                "该接口会对 python-requests 的 TLS 指纹做风控（同一时刻 curl 正常），"
+                "需 curl_cffi 浏览器指纹伪装才能稳定取数。"
+            )
         categories = result.get(code, [])
         if not categories:
             return f"No concept/block data for {code}"
@@ -2271,7 +2038,7 @@ def get_concept_blocks(
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error fetching concept blocks for {code}: {str(e)}"
+        return f"Error fetching concept blocks for {code}: {safe_error(e)}"
 
 
 # ---- 14. get_fund_flow ----
@@ -2301,6 +2068,14 @@ def get_fund_flow(
         "",
     ]
 
+    historical = _is_historical(curr_date)
+    if historical:
+        # 分钟级资金流只有"今天"的，复盘历史日期时整段都是未来数据，直接不取。
+        lines.append(
+            f"（分析日期 {curr_date} 早于今天，已略去实时分钟资金流——"
+            f"那是今天的盘中数据，不是 {curr_date} 当天的。）\n"
+        )
+
     try:
         # Realtime minute-level fund flow
         url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
@@ -2309,9 +2084,11 @@ def get_fund_flow(
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57",
         }
-        r = _em_get(url_rt, params=params_rt, timeout=10)
-        d = r.json()
-        klines = d.get("data", {}).get("klines", [])
+        klines = []
+        if not historical:
+            r = _em_get(url_rt, params=params_rt, timeout=10)
+            d = r.json()
+            klines = d.get("data", {}).get("klines", [])
 
         if klines:
             lines.append(
@@ -2353,8 +2130,18 @@ def get_fund_flow(
                 "https://push2his.eastmoney.com"
                 "/api/qt/stock/fflow/daykline/get"
             )
+            # 接口返回的是"从今天回溯 lmt 个交易日"，没有 end_date 参数。复盘一个
+            # 较早的日期时，若仍只要 20 天，过滤后会**一行不剩**——把"数据不对"
+            # 变成"没有数据"，比不过滤更糟。按分析日与今天的间隔把窗口放大到能
+            # 覆盖到那一段（上限 500，够回溯约两年）。
+            hist_limit = 20
+            if historical:
+                gap_days = (_market_today() - datetime.strptime(
+                    str(curr_date)[:10], "%Y-%m-%d").date()).days
+                # 日历日 → 交易日约 ×0.7，再多留 20 天余量
+                hist_limit = min(500, 20 + int(gap_days * 0.7) + 20)
             params_hist = {
-                "secid": secid, "lmt": 20, "klt": 101,
+                "secid": secid, "lmt": hist_limit, "klt": 101,
                 "fields1": "f1,f2,f3,f7",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57",
             }
@@ -2362,10 +2149,31 @@ def get_fund_flow(
             dh = rh.json()
             hist_klines = dh.get("data", {}).get("klines", [])
 
-            if hist_klines:
+            # 逐行按分析日截断：接口返回的是"从今天回溯 20 个交易日"，
+            # 在历史日期上直接打印等于把未来的资金流喂给模型（未来函数）。
+            if historical:
+                cutoff = str(curr_date)[:10]
+                hist_klines = [
+                    k for k in hist_klines if k.split(",")[0][:10] <= cutoff
+                ]
+                # 窗口是为了"够回溯到分析日"才放大的，过滤完要裁回承诺的 20 个交易日。
+                # 不裁的话，复盘 90 天前会返回约 40 行——既改变了请求的趋势窗口，
+                # 又把每次情绪工具的返回体撑大一倍。
+                hist_klines = hist_klines[-20:]
+
+            if historical and not hist_klines:
+                # 说清楚是"这个日期取不到"，而不是让正文里凭空少一段
+                lines.append(
+                    f"\n## Historical Daily Fund Flow\n"
+                    f"（{str(curr_date)[:10]} 及之前的资金流未能取到：该接口只提供"
+                    f"从今天回溯的窗口，分析日过早时可能已超出可回溯范围。）"
+                )
+            elif hist_klines:
                 lines.append(
                     f"\n## Historical Daily Fund Flow "
-                    f"(last {len(hist_klines)} trading days)"
+                    f"(last {len(hist_klines)} trading days"
+                    + (f", 截至 {str(curr_date)[:10]}" if historical else "")
+                    + ")"
                 )
                 lines.append(
                     "Date | 主力净流入(万) | 大单(万) "
@@ -2386,7 +2194,7 @@ def get_fund_flow(
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error fetching fund flow for {code}: {str(e)}"
+        return f"Error fetching fund flow for {code}: {safe_error(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -2409,7 +2217,7 @@ def get_dragon_tiger_board(
         Formatted text with LHB appearances, top buyer/seller seats,
         and institutional activity.
     """
-    code = safe_ticker_component(ticker)
+    code = _normalize_ticker(ticker)
     end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
     start_dt = end_dt - pd.Timedelta(days=look_back_days)
     start_date_str = start_dt.strftime("%Y-%m-%d")
@@ -2443,7 +2251,7 @@ def get_dragon_tiger_board(
                     f"| {turnover:.2f}%"
                 )
     except Exception as e:
-        lines.append(f"龙虎榜列表查询失败: {e}")
+        lines.append(f"龙虎榜列表查询失败: {safe_error(e)}")
 
     # 2. 最近上榜的买卖席位 — eastmoney datacenter direct HTTP
     try:
@@ -2537,7 +2345,7 @@ def get_lockup_expiry(
         Formatted text with historical unlock records and upcoming
         expiry calendar with impact metrics.
     """
-    code = safe_ticker_component(ticker)
+    code = _normalize_ticker(ticker)
     lines = [f"# 限售解禁日历 | {code} | {trade_date}"]
 
     # 1. 历史解禁记录 — eastmoney datacenter direct HTTP
@@ -2562,7 +2370,7 @@ def get_lockup_expiry(
         else:
             lines.append("\n无历史解禁记录。")
     except Exception as e:
-        lines.append(f"个股解禁查询失败: {e}")
+        lines.append(f"个股解禁查询失败: {safe_error(e)}")
 
     # 2. 未来待解禁 — eastmoney datacenter direct HTTP
     try:
@@ -2593,7 +2401,7 @@ def get_lockup_expiry(
         else:
             lines.append(f"\n未来 {forward_days} 天无待解禁。")
     except Exception as e:
-        lines.append(f"解禁日历查询失败: {e}")
+        lines.append(f"解禁日历查询失败: {safe_error(e)}")
 
     return "\n".join(lines)
 
@@ -2618,7 +2426,7 @@ def get_industry_comparison(
         Formatted text with sector performance ranking, highlighting
         the sector the target stock belongs to.
     """
-    code = safe_ticker_component(ticker)
+    code = _normalize_ticker(ticker)
     lines = [f"# 行业横向对比 | {code} | {trade_date}"]
 
     # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
@@ -2664,6 +2472,6 @@ def get_industry_comparison(
         else:
             lines.append("行业数据获取为空。")
     except Exception as e:
-        lines.append(f"行业对比查询失败: {e}")
+        lines.append(f"行业对比查询失败: {safe_error(e)}")
 
     return "\n".join(lines)

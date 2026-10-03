@@ -1,25 +1,10 @@
 """Append-only markdown decision log for TradingAgents."""
 
-from functools import wraps
-from threading import RLock
-from typing import Callable, List, Optional, TypeVar
+from typing import List, Optional
 from pathlib import Path
 import re
 
 from tradingagents.agents.utils.rating import parse_rating
-
-
-_MEMORY_LOG_LOCK = RLock()
-_T = TypeVar("_T")
-
-
-def _memory_locked(method: Callable[..., _T]) -> Callable[..., _T]:
-    @wraps(method)
-    def wrapped(*args, **kwargs):
-        with _MEMORY_LOG_LOCK:
-            return method(*args, **kwargs)
-
-    return wrapped
 
 
 class TradingMemoryLog:
@@ -43,7 +28,6 @@ class TradingMemoryLog:
 
     # --- Write path (Phase A) ---
 
-    @_memory_locked
     def store_decision(
         self,
         ticker: str,
@@ -67,7 +51,6 @@ class TradingMemoryLog:
 
     # --- Read path (Phase A) ---
 
-    @_memory_locked
     def load_entries(self) -> List[dict]:
         """Parse all entries from log. Returns list of dicts."""
         if not self._log_path or not self._log_path.exists():
@@ -114,7 +97,6 @@ class TradingMemoryLog:
 
     # --- Update path (Phase B) ---
 
-    @_memory_locked
     def update_with_outcome(
         self,
         ticker: str,
@@ -180,7 +162,6 @@ class TradingMemoryLog:
         tmp_path.write_text(new_text, encoding="utf-8")
         tmp_path.replace(self._log_path)
 
-    @_memory_locked
     def batch_update_with_outcomes(self, updates: List[dict]) -> None:
         """Apply multiple outcome updates in a single read + atomic write.
 
