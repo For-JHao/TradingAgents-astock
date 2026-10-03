@@ -9,7 +9,7 @@ from tradingagents.llm_clients.openai_client import MinimaxChatOpenAI
 
 @pytest.mark.unit
 def test_deepseek_v4_and_reasoner_reject_tool_choice():
-    for model in ("deepseek-v4-flash", "deepseek-v4-pro", "deepseek-reasoner"):
+    for model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-reasoner"):
         capabilities = get_capabilities(model)
         assert capabilities.supports_tool_choice is False
         assert capabilities.requires_reasoning_content_roundtrip is True
@@ -103,14 +103,15 @@ def test_deepseek_v4_family_still_matched_by_pattern():
 
 
 @pytest.mark.unit
-def test_explicit_tool_choice_is_dropped_for_unsupported_model():
+@pytest.mark.parametrize("model", ["deepseek-v4-pro", "deepseek-flash"])
+def test_explicit_tool_choice_is_dropped_for_unsupported_model(model):
     """能力表声明「不支持 tool_choice」就必须真正生效。
     原实现用 setdefault，调用方显式传入时会被保留，API 调用照样失败。"""
     from unittest.mock import patch
     from langchain_openai import ChatOpenAI
     from tradingagents.llm_clients.openai_client import DeepSeekChatOpenAI
 
-    client = DeepSeekChatOpenAI(model="deepseek-v4-pro", api_key="x")
+    client = DeepSeekChatOpenAI(model=model, api_key="x")
 
     class _Schema(BaseModel):
         value: str

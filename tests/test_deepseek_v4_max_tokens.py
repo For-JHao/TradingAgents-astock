@@ -28,7 +28,7 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 @pytest.mark.unit
 class TestV4GetsMaxTokens:
     def test_v4_exact_ids_get_8192(self):
-        for model in ("deepseek-v4-flash", "deepseek-v4-pro", "deepseek-reasoner"):
+        for model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-reasoner"):
             cap = get_capabilities(model)
             assert cap.default_max_tokens == _DEEPSEEK_V4_DEFAULT_MAX_TOKENS
 
