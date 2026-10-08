@@ -70,6 +70,16 @@ def _normalize_ticker(symbol: str) -> str:
     return safe_ticker_component(s)
 
 
+def _tencent_quote_at(value):
+    """Tencent field 30 is exchange-local quote time, not HTTP receipt time."""
+    from zoneinfo import ZoneInfo
+    try:
+        if not isinstance(value, str) or not _re.fullmatch(r"\d{14}", value):
+            return None
+        return datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Shanghai")).isoformat()
+    except ValueError:
+        return None
+
 def _tencent_quote(codes: list[str]) -> dict[str, dict]:
     """Batch real-time quotes from Tencent Finance (qt.gtimg.cn).
 
@@ -93,6 +103,8 @@ def _tencent_quote(codes: list[str]) -> dict[str, dict]:
         code = key[2:]  # strip sh/sz/bj prefix
         candidate = {
             "name": vals[1],
+            "source": "tencent",
+            "quote_at": _tencent_quote_at(vals[30]),
             "price": finite_number(vals[3]),
             "last_close": finite_number(vals[4]),
             "open": finite_number(vals[5]),

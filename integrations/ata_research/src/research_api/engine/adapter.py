@@ -19,6 +19,7 @@ class EngineResult:
     state: dict
     signal: str
     private_output: Path
+    memory_enabled: bool | None = None
 
 class EngineAdapter:
     def analyze(self, spec, runtime):
@@ -41,6 +42,6 @@ class EngineAdapter:
                 private = attempt_root / "results" / spec.ticker / "TradingAgentsStrategy_logs" / f"full_states_log_{spec.trade_date}.json"
                 if not private.is_file():
                     raise ValueError("private_engine_output_missing")
-                return EngineResult(state, signal, private)
+                return EngineResult(state, signal, private, bool(config.get("memory_log_path")))
             finally:
                 graph.close_graph_run()

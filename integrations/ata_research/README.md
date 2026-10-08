@@ -52,3 +52,24 @@ Deterministic tests use a temporary database/report/memory/cache root and
 Tests use fixtures/stubs, without paid model calls or production data. Linux
 systemd identity/permissions and real-model shared prod/pre acceptance remain
 `external_validation_pending` until the approved exact production release.
+
+## Account-context publication and quote provenance
+
+New report metadata adds `contextVersion: 1`, the job's effective
+`selectedAnalysts`, and `memoryUsed` from the adapter's effective
+`memory_log_path` configuration plus the actual `past_context` state. Missing or
+inconsistent evidence remains null. The original full report state, decisions,
+debate histories and injected context are preserved; no graph or memory behavior
+changes. Historical files are never backfilled or rewritten.
+
+`/market/quotes` retains legacy receipt-time `ts`. Optional `source` and
+`quote_at` describe Tencent field 30 in Asia/Shanghai; unavailable source time
+stays null, including the existing Eastmoney fallback. `session_status`,
+`latest_session_date`, `session_closed_at` and `calendar_proof` come from a
+bounded read of the installed AkShare `file_fold/calendar.json`: strict date
+schema/order, actual coverage bounds and SHA256. Fixed A-share morning/afternoon
+hours are combined with calendar membership; no weekday holiday guesses,
+online refresh, new dependency or background timer is introduced. Outside the
+bundled coverage, or on invalid calendar data, the session proof is unavailable.
+The platform validates quote observation age and the last completed session;
+post-close source observations may be later than 15:00.

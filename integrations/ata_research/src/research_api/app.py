@@ -347,6 +347,9 @@ def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
 
     from research_api.data.provider import finite_number
     now_ts = time.time()
+    from datetime import datetime, timezone
+    from research_api.data.market_session import market_session
+    session = market_session(datetime.fromtimestamp(now_ts, timezone.utc))
     quotes: list[dict[str, Any]] = []
     for code in normalized:
         item = quote_map.get(code)
@@ -356,6 +359,8 @@ def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
                 if snapshot:
                     item = {
                         "name": snapshot.get("f58"),
+                        "source": "eastmoney",
+                        "quote_at": None,
                         "price": finite_number(snapshot.get("f43")),
                         "last_close": finite_number(snapshot.get("f60")),
                         "open": finite_number(snapshot.get("f46")),
@@ -381,6 +386,9 @@ def get_market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
                 "volume": None,
                 "turnover_pct": finite_number(item.get("turnover_pct"), positive=False),
                 "ts": now_ts,
+                "source": item.get("source"),
+                "quote_at": item.get("quote_at"),
+                **session,
             }
         )
 

@@ -71,6 +71,13 @@ class MarketQuotesRequest(BaseModel):
     codes: list[str] = Field(default_factory=list, description="A-share 6-digit code list")
 
 
+class MarketCalendarProof(BaseModel):
+    source: Literal["akshare-bundled-calendar"]
+    sha256: str
+    coverage_start: str
+    coverage_end: str
+
+
 class MarketQuoteItem(BaseModel):
     code: str
     name: str | None = None
@@ -83,6 +90,12 @@ class MarketQuoteItem(BaseModel):
     volume: float | None = None
     turnover_pct: float | None = None
     ts: float
+    source: str | None = None
+    quote_at: str | None = None
+    session_status: Literal["trading", "closed"] | None = None
+    latest_session_date: str | None = None
+    session_closed_at: str | None = None
+    calendar_proof: MarketCalendarProof | None = None
 
 
 class MarketQuotesResponse(BaseModel):

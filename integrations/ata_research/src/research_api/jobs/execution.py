@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import os, time
 import httpx, requests
 from research_api.http.errors import safe_error
-from research_api.storage.reports import publish_report
+from research_api.storage.reports import publish_report, report_context_metadata
 
 REPORT_FIELDS = {"market": "market_report", "sentiment": "sentiment_report", "news": "news_report", "fundamentals": "fundamentals_report", "policy": "policy_report", "hot_money": "hot_money_report", "lockup": "lockup_report", "investment_plan": "investment_plan", "trader_investment_plan": "trader_investment_plan"}
 
@@ -37,7 +37,7 @@ def run_job(job, *, lock, store, semaphore, retries, retry_delay, adapter=None):
                 result = adapter.analyze(job, SimpleNamespace(directory=directory, progress=progress))
                 progress("report_publication")
                 report_path = publish_report(result.state, root, job.ticker, job.trade_date, job.job_id,
-                    {"engineVersion": ENGINE_VERSION, "engineSha": ENGINE_SHA, "integrationVersion": INTEGRATION_VERSION})
+                    {"engineVersion": ENGINE_VERSION, "engineSha": ENGINE_SHA, "integrationVersion": INTEGRATION_VERSION, **report_context_metadata(result.state, job.selected_analysts, getattr(result, "memory_enabled", None))})
                 summary = summarize_state(result.state, ticker=job.ticker, trade_date=job.trade_date, signal=result.signal, report_path=report_path)
                 # Completion is not visible in memory until the exact succeeded record is durable.
                 progress("job_commit")

@@ -32,3 +32,11 @@ def publish_report(state, root, ticker, trade_date, job_id, metadata):
         return str(target.resolve())
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+def report_context_metadata(state, selected_analysts, memory_enabled=None):
+    """Publish effective engine configuration and actual context, without altering it."""
+    context = state.get("past_context")
+    valid = isinstance(context, str) and isinstance(memory_enabled, bool)
+    # Disabled memory with nonempty injected text is a contract mismatch.
+    memory_used = memory_enabled if valid and (memory_enabled or not context) else None
+    return {"contextVersion": 1, "selectedAnalysts": list(selected_analysts), "memoryUsed": memory_used}
