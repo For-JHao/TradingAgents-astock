@@ -69,6 +69,20 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
                 response=await self.client.get("/research/jobs/job1/account-advice-model",params=self.query)
                 self.assertEqual(response.json()["reasonCode"],"model_unavailable")
 
+    async def test_prompt_upgrade_changes_identity_and_rejects_stale_descriptor_before_call(self):
+        with patch.object(advice,"PROMPT_VERSION","research-account-1"):
+            previous=await self.descriptor()
+            stale=await self.invocation()
+        current=await self.descriptor()
+        self.assertEqual((previous["promptVersion"],current["promptVersion"]),("research-account-1","research-account-2"))
+        self.assertNotEqual(previous["modelIdentity"],current["modelIdentity"])
+        self.assertEqual(current["promptUtf8Bytes"],len(advice.SYSTEM_PROMPT.encode()))
+        with patch.object(advice,"native_model") as factory:
+            response=await self.client.post("/research/jobs/job1/account-advice",json=stale)
+            self.assertEqual(response.status_code,409)
+            self.assertEqual(response.json()["reasonCode"],"context_identity_mismatch")
+            factory.assert_not_called()
+
     async def test_auth_precedes_body_parse_and_validation_never_reflects_payload(self):
         for token,reason in [("wrong","model_auth_error"),("","model_auth_error")]:
             response=await self.client.post("/research/jobs/job1/account-advice",content="private-value"*1000,headers={"Authorization":"Bearer "+token})
