@@ -43,7 +43,7 @@ from research_api.jobs.model import _Job
 
 
 def service_identity():
-    return {"engineVersion": "v0.5.20", "integrationVersion": "1.0.0", "contractVersion": 1, "profile": "shared"}
+    return {"engineVersion": "v0.5.21", "integrationVersion": "1.1.0", "contractVersion": 1, "profile": "shared"}
 
 # Disable third-party wire payload logging in ordinary service logs.
 import logging
@@ -277,6 +277,11 @@ def _restore_jobs() -> None:
 _restore_jobs()
 
 
+def _account_job_snapshot(job_id):
+    with _lock:
+        job = _jobs.get(job_id)
+        return copy.deepcopy(job.persistence_record()) if job else None
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     with _lock:
@@ -506,6 +511,17 @@ def get_research_job_by_client_request_id(client_request_id: str) -> dict[str, A
         if not job:
             raise HTTPException(status_code=404, detail="Research job not found")
         return job.snapshot()
+
+
+@app.get("/research/jobs/{job_id}/account-advice-model")
+async def account_advice_model_endpoint(request: Request, job_id: str):
+    from research_api.account_advice import model_descriptor
+    return await model_descriptor(request, job_id, _account_job_snapshot)
+
+@app.post("/research/jobs/{job_id}/account-advice")
+async def account_advice_endpoint(request: Request, job_id: str):
+    from research_api.account_advice import account_advice
+    return await account_advice(request, job_id, _account_job_snapshot)
 
 
 @app.get("/research/jobs/{job_id}", response_model=ResearchJobStatus)

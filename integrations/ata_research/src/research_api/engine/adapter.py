@@ -9,9 +9,9 @@ from tradingagents.dataflows.config import runtime_context, assert_tracking_heal
 from research_api.extensions.etf.extension import etf_extensions
 from research_api.storage.memory import SynchronizedMemoryLog
 
-ENGINE_VERSION = "v0.5.20"
-ENGINE_SHA = "d393981690826e46d4fb3d52e8fe7765fdc8b9cb"
-INTEGRATION_VERSION = "1.0.0"
+ENGINE_VERSION = "v0.5.21"
+ENGINE_SHA = "e3981af1e4c94656cdc663f1466d54fd49253dd5"
+INTEGRATION_VERSION = "1.1.0"
 CONTRACT_VERSION = 1
 
 @dataclass(frozen=True)

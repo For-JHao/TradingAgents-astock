@@ -1,8 +1,8 @@
 # ATA Research integration
 
 This service preserves the existing internal HTTP contract and SQLite job schema.
-The engine baseline is TradingAgents-astock v0.5.20 at
-`d393981690826e46d4fb3d52e8fe7765fdc8b9cb`. The integration has its own manifest;
+The engine baseline is TradingAgents-astock v0.5.21 at
+`e3981af1e4c94656cdc663f1466d54fd49253dd5`. The integration has its own manifest;
 install third-party dependencies from both manifests together, without installing
 project wheels. The native dependency combination uses HTTPX <0.26 with mootdx;
 Google and Agent SDK extras are not installed by this integration. Selecting an
@@ -52,6 +52,20 @@ Deterministic tests use a temporary database/report/memory/cache root and
 Tests use fixtures/stubs, without paid model calls or production data. Linux
 systemd identity/permissions and real-model shared prod/pre acceptance remain
 `external_validation_pending` until the approved exact production release.
+
+## Financial statement baseline
+
+Company financial statements use v0.5.21's Sina `report_list` parser and its
+announcement/ingestion-date filter. The three statement tools require a nonempty
+analysis date. Historical native missing-task retries supply that task's analysis
+date only for invocation and retain the original task arguments and identity.
+The existing scoped missing-data failure checks and safe error projection apply.
+
+This filter retains upstream's legal-deadline inference when original dates are
+lost, the specific 2020-03-13 batch-ingestion handling, and historical restatement
+limits. It does not establish strict historical point-in-time financial values.
+No historical report, memory entry or missing-task record is migrated or rewritten
+by installing this baseline.
 
 ## Account-context publication and quote provenance
 

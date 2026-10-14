@@ -6,7 +6,7 @@
 - **仓库**: https://github.com/simonlin1212/TradingAgents-astock
 - **协议**: Apache 2.0
 - **Python**: >=3.10
-- **当前版本**: 0.5.20（2026-09-21）
+- **当前版本**: 0.5.21（2026-10-11）
   ⚠️ 改版本号时**三处要一起改**：`pyproject.toml` / `CHANGELOG.md` / 这一行。漏了这行会让后续 agent 和发版流程读到旧版本（`tests/test_version_consistency.py` 会拦）。
 
 ## 架构
@@ -61,6 +61,15 @@ curr_date 过滤历史行、复盘时整段不取实时分钟数据）；数据�
 （腾讯实时估值、同花顺当前一致预期）就在正文顶部**明确告警**并指示模型不得当作当天
 事实。**新增任何收 `curr_date` 的接口，必须处理这两种情况之一，不能收了不用。**
 
+财报三表（v0.5.21）按「已公布」截断，不按报告期，都是严格早于分析日：新浪公告日早于分析日；
+或入库时间 `update_time`（转北京时间）早于分析日当天；或两个日期都晚于报告期一年以上 / 缺失
+（原始日期已丢）时，才按法定披露截止日（`_report_deadline`）判断；同一入库时间被 3 期及以上
+共用、且在 2020-03-13（`_SINA_BATCH_IMPORT_DAY`，新浪全市场批量入库）的只能放行、不算原始日期——
+别的日期多期共用可能是逾期公司补发，**别放宽成不限日期**。⚠️ **别改成只按公告日筛**——
+公告日会被次年同期报表、下一期报表的对比数改写成更晚的日期，回看时会把早已公布的财报整批丢掉。
+⚠️ **也别退回「截止日或公告日」**——逾期披露的公司（300630 的 2023 年报 2024-07-05 才发）截止日
+一过就提前露出来。两个日期列只在内部用，不放进返回表；三张表工具的 `curr_date` 是必填。
+
 ### 非 A 股代码防护（v0.5.3 新增，v0.5.5 补全）
 `_normalize_ticker()` 会拒绝港股（4~5 位数字 / `.HK`）与美股代码。**新增任何 vendor
 方法都必须走它，不要直接调 `safe_ticker_component`**——后者只做路径安全校验，不认市场。
@@ -99,7 +108,7 @@ deepseek-v4-flash 等模型在 tool call 时可能返回中文股票名而非 6 
 
 ### 测试
 **干净 clone（`pip install -e .` 不带 `[agentsdk]`）跑 `pytest tests/` 应当是
-512 passed / 13 skipped / **0 failed**（v0.5.20 实测，Python 3.13）。出现 failed 就是真回归。**
+562 passed / 14 skipped / **0 failed**（v0.5.21 实测，Python 3.12；跳过的都是没装的可选依赖 claude-agent-sdk / langchain-google-genai）。出现 failed 就是真回归。**
 需要可选依赖的用例用 `requires_sdk` 标记跳过——⚠️ **占位类型绝不要用 `Exception`
 基类**：`ClaudeSDKError` 曾被占位成 `Exception`，进 `_FALLBACK_ERRORS` 后让"订阅凭据
 失效不得降级到计费 provider"这条护栏彻底失效（v0.5.4 修）。

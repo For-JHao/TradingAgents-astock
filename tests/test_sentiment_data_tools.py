@@ -37,20 +37,28 @@ def test_graph_tool_node_matches_analyst_tools():
     """图里注册的 social 工具必须与分析师绑定的一致，否则运行时才炸。"""
     import tradingagents.graph.trading_graph as tg
 
-    src = inspect.getsource(tg.TradingAgentsGraph._create_tool_nodes)
-    social_block = re.search(
-        r'"social": ToolNode\(\s*\[(.*?)\]\s*'
-        r'(?:,\s*wrap_tool_call\s*=\s*make_tool_call_recorder\("social"\))?\s*,?\s*\)',
-        src,
-        re.S,
-    )
-    assert social_block, "找不到 social 的 ToolNode 定义"
-    registered = {
-        t.strip().rstrip(",")
-        for t in social_block.group(1).split("\n")
-        if t.strip().rstrip(",") and not t.strip().startswith("#")
-    }
-    assert registered == EXPECTED_TOOLS
+    from types import SimpleNamespace
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableLambda
+
+    class CapturingLLM(RunnableLambda):
+        def __init__(self):
+            self.bound = set()
+            super().__init__(lambda prompt: AIMessage(content="情绪分析报告"))
+
+        def bind_tools(self, tools):
+            self.bound = {tool.name for tool in tools}
+            return self
+
+    llm = CapturingLLM()
+    sma.create_social_media_analyst(llm)({
+        "company_of_interest": "600519",
+        "trade_date": "2026-10-03",
+        "messages": [],
+    })
+    nodes = tg.TradingAgentsGraph._create_tool_nodes(SimpleNamespace(extensions=None))
+    assert set(nodes["social"].tools_by_name) == llm.bound == EXPECTED_TOOLS
+
 
 
 def test_prompt_names_every_bound_tool():

@@ -114,6 +114,39 @@ def test_same_tools_bind_model_and_execution_and_native_default(tmp_path):
         assert llm.bound[-1] == list(native.tool_nodes["market"].tools_by_name) == ["get_stock_data", "get_indicators"]
         assert set(native.workflow.nodes) == set(graph.workflow.nodes)
 
+@pytest.mark.parametrize("tool_name", ["get_balance_sheet", "get_cashflow", "get_income_statement"])
+@pytest.mark.parametrize("extended", [False, True])
+def test_statement_date_contract_through_real_toolnode(tmp_path, monkeypatch, tool_name, extended):
+    from tradingagents.agents.analysts.fundamentals_analyst import create_fundamentals_analyst
+    from tradingagents.agents.utils import fundamental_data_tools
+
+    statement_tool = getattr(fundamental_data_tools, tool_name)
+    extension = AnalystExtension((statement_tool,), "statement extension") if extended else None
+    extensions = GraphExtensions(analysts={"fundamentals": extension}) if extended else None
+    nodes = TradingAgentsGraph._create_tool_nodes(SimpleNamespace(extensions=extensions))
+    llm = StubLLM()
+    state = {"company_of_interest": "600519", "trade_date": "2026-10-03", "messages": []}
+    seen = []
+
+    def vendor(name, ticker, frequency, current_date):
+        seen.append((name, ticker, frequency, current_date, get_config()["missing_data_dir"]))
+        return "报告日,货币资金\n2026-06-30,111.0"
+
+    monkeypatch.setattr(fundamental_data_tools, "route_to_vendor", vendor)
+    with runtime_context({"missing_data_dir": str(tmp_path / "missing")}):
+        create_fundamentals_analyst(llm, extension)(state)
+        assert llm.bound[-1] == list(nodes["fundamentals"].tools_by_name)
+        assert "curr_date" in nodes["fundamentals"].tools_by_name[tool_name].args_schema.model_json_schema()["required"]
+        state["messages"] = [AIMessage(content="", tool_calls=[{
+            "name": tool_name, "args": {"ticker": "600519", "curr_date": "2026-10-03"},
+            "id": "statement", "type": "tool_call",
+        }])]
+        result = execute_toolnode(nodes["fundamentals"], state)
+        assert result["messages"][-1].content == "报告日,货币资金\n2026-06-30,111.0"
+        assert seen == [(tool_name, "600519", "quarterly", "2026-10-03", str(tmp_path / "missing"))]
+        assert_tracking_healthy()
+
+
 def test_memory_same_day_dedup_and_parallel_different_days(tmp_path):
     memory = SynchronizedMemoryLog({"memory_log_path": str(tmp_path / "memory.md")})
     def write(index):

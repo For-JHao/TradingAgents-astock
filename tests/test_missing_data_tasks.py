@@ -324,3 +324,75 @@ def test_fresh_run_removes_stale_active_and_consumed_tasks(missing_index):
     assert missing_data.get_missing_tasks(
         "300476", "2026-06-03", active_only=False
     ) == []
+
+
+@pytest.mark.parametrize("old_args", [
+    {"ticker": "600519"},
+    {"ticker": "600519", "curr_date": None},
+    {"ticker": "600519", "curr_date": ""},
+])
+def test_retry_fills_curr_date_for_calls_recorded_before_it_was_required(missing_index, monkeypatch, old_args):
+    """v0.5.21 起财报三表的 curr_date 必填；升级前记下的调用没有它（或传了空值），重试时按任务的
+    分析日补上，结果仍记到原来那条任务上。"""
+    from langchain_core.tools import tool
+
+    seen = []
+
+    @tool
+    def get_balance_sheet(ticker: str, curr_date: str, freq: str = "quarterly") -> str:
+        """Balance sheet."""
+        seen.append((ticker, curr_date, freq))
+        return "| 报告日 | 货币资金 |\n|---|---|\n| 2026-03-31 | 111.0 |"
+
+    task = missing_data.record_tool_result(
+        ticker="600519",
+        trade_date="2026-06-03",
+        stage="fundamentals",
+        tool_name="get_balance_sheet",
+        args=old_args,
+        content="Error retrieving balance sheet for 600519: timeout",
+    )
+    assert task is not None
+    monkeypatch.setattr(missing_data, "_tool_registry", lambda: {"get_balance_sheet": get_balance_sheet})
+    monkeypatch.setattr(
+        missing_data,
+        "sync_missing_snapshot_to_analysis_log",
+        lambda ticker, date, **kwargs: None,
+    )
+
+    result = missing_data.retry_missing_tasks("600519", "2026-06-03")
+
+    assert seen == [("600519", "2026-06-03", "quarterly")]
+    assert result["resolved_count"] == 1
+    assert result["remaining_count"] == 0
+
+
+def test_retry_does_not_add_curr_date_to_tools_that_do_not_require_it(missing_index, monkeypatch):
+    from langchain_core.tools import tool
+
+    seen = []
+
+    @tool
+    def get_news(ticker: str, curr_date: str = "") -> str:
+        """News."""
+        seen.append(curr_date)
+        return "一条新闻"
+
+    missing_data.record_tool_result(
+        ticker="600519",
+        trade_date="2026-06-03",
+        stage="news",
+        tool_name="get_news",
+        args={"ticker": "600519"},
+        content="Error: upstream timeout",
+    )
+    monkeypatch.setattr(missing_data, "_tool_registry", lambda: {"get_news": get_news})
+    monkeypatch.setattr(
+        missing_data,
+        "sync_missing_snapshot_to_analysis_log",
+        lambda ticker, date, **kwargs: None,
+    )
+
+    missing_data.retry_missing_tasks("600519", "2026-06-03")
+
+    assert seen == [""]
