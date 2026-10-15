@@ -70,11 +70,11 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.json()["reasonCode"],"model_unavailable")
 
     async def test_prompt_upgrade_changes_identity_and_rejects_stale_descriptor_before_call(self):
-        with patch.object(advice,"PROMPT_VERSION","research-account-1"):
+        with patch.object(advice,"PROMPT_VERSION","research-account-2"):
             previous=await self.descriptor()
             stale=await self.invocation()
         current=await self.descriptor()
-        self.assertEqual((previous["promptVersion"],current["promptVersion"]),("research-account-1","research-account-2"))
+        self.assertEqual((previous["promptVersion"],current["promptVersion"]),("research-account-2","research-account-3"))
         self.assertNotEqual(previous["modelIdentity"],current["modelIdentity"])
         self.assertEqual(current["promptUtf8Bytes"],len(advice.SYSTEM_PROMPT.encode()))
         with patch.object(advice,"native_model") as factory:
