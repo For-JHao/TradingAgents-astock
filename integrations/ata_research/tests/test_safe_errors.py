@@ -80,10 +80,11 @@ def test_existing_stock_catches_and_missing_recorder_keep_failures_and_category(
         with patch.object(a_stock, "_em_get", side_effect=requests.exceptions.Timeout(SENTINEL)):
             content = a_stock.get_fund_flow("601689", "2026-10-15")
         assert "[category=timeout]" in content
-        # A non-string F10 payload simulates the unchanged upstream .strip() risk; no TCP request.
-        with patch.object(a_stock, "_mootdx_call", return_value={"unexpected": "public fixture"}):
+        # A non-string native payload now uses the HTTP fallback; keep every source isolated.
+        with patch.object(a_stock, "_mootdx_call", return_value={"unexpected": "public fixture"}), \
+             patch.object(a_stock, "_em_get", side_effect=requests.exceptions.Timeout(SENTINEL)):
             f10_content = a_stock.get_insider_transactions("601689")
-        assert "[category=attribute_error]" in f10_content
+        assert "[category=timeout]" in f10_content
         for name, text in (("get_fund_flow", content), ("get_insider_transactions", f10_content)):
             request = SimpleNamespace(state={"company_of_interest": "601689", "trade_date": "2026-10-15"},
                                       tool_call={"name": name, "args": {"ticker": "601689"}, "id": name})
@@ -95,7 +96,7 @@ def test_existing_stock_catches_and_missing_recorder_keep_failures_and_category(
         assert all(task["severity"] == "failed" and task["status"] == "active" for task in tasks)
         assert {task["tool_name"] for task in tasks} == {"get_fund_flow", "get_insider_transactions"}
         assert any("[category=timeout]" in task["message"] for task in tasks)
-        assert any("[category=attribute_error]" in task["message"] for task in tasks)
+        assert all("[category=timeout]" in task["message"] for task in tasks)
         assert_tracking_healthy()
         serialized = json.dumps(tasks) + (tmp_path / "missing" / "index.json").read_text() + caplog.text
         assert SENTINEL not in serialized

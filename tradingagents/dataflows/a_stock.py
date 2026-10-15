@@ -1596,6 +1596,7 @@ def get_global_news(
     start_date = start_dt.strftime("%Y-%m-%d")
 
     all_news: list[dict] = []
+    source_failures: list[str] = []
 
     # Source 1: CLS wire (财联社快讯) — direct HTTP
     try:
@@ -1603,8 +1604,18 @@ def get_global_news(
         cls_params = {"rn": str(limit), "page": "1"}
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
         r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
+        r_cls.raise_for_status()
         d_cls = r_cls.json()
-        for item in d_cls.get("data", {}).get("roll_data", []):
+        cls_data = d_cls.get("data")
+        if not isinstance(cls_data, dict):
+            raise TypeError("invalid_news_payload")
+        cls_rows = cls_data.get("roll_data")
+        if not isinstance(cls_rows, list) or any(not isinstance(row, dict) for row in cls_rows):
+            raise TypeError("invalid_news_rows")
+        if any(not isinstance(row.get(field, ""), str)
+               for row in cls_rows for field in ("title", "brief", "content")):
+            raise TypeError("invalid_news_text")
+        for item in cls_rows:
             title = item.get("title", "") or item.get("brief", "")
             content = item.get("content", "") or item.get("brief", "")
             ctime = item.get("ctime", "")
@@ -1623,6 +1634,7 @@ def get_global_news(
             })
     except Exception as e:
         logger.warning("CLS news fetch failed: %s", safe_error(e))
+        source_failures.append(f"[数据缺失: 财联社宏观新闻来源失败] {safe_error(e)}")
 
     # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
     try:
@@ -1637,8 +1649,18 @@ def get_global_news(
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
         r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
+        r_em.raise_for_status()
         d_em = r_em.json()
-        for item in d_em.get("data", {}).get("fastNewsList", []):
+        em_data = d_em.get("data")
+        if not isinstance(em_data, dict):
+            raise TypeError("invalid_news_payload")
+        em_rows = em_data.get("fastNewsList")
+        if not isinstance(em_rows, list) or any(not isinstance(row, dict) for row in em_rows):
+            raise TypeError("invalid_news_rows")
+        if any(not isinstance(row.get(field, ""), str)
+               for row in em_rows for field in ("title", "summary")):
+            raise TypeError("invalid_news_text")
+        for item in em_rows:
             title = item.get("title", "")
             summary = item.get("summary", "")[:200]
             pub_time = item.get("showTime", "")
@@ -1650,8 +1672,14 @@ def get_global_news(
             })
     except Exception as e:
         logger.warning("Eastmoney global news fetch failed: %s", safe_error(e))
+        source_failures.append(f"[数据缺失: 东财宏观新闻来源失败] {safe_error(e)}")
 
     if not all_news:
+        if len(source_failures) == 2:
+            errors = [_re.sub(r"\[数据缺失: ([^\]]+)\]", r"\1:", failure) for failure in source_failures]
+            return "Error fetching global news: " + "\n".join(errors)
+        if source_failures:
+            return f"No global news found for {curr_date}\n" + "\n".join(source_failures)
         return f"No global news found for {curr_date}"
 
     # Deduplicate by title
@@ -1677,10 +1705,193 @@ def get_global_news(
     return (
         f"## China & Global Market News, from {start_date} to {curr_date}:\n\n"
         + news_str
+        + ("\n" + "\n".join(source_failures) if source_failures else "")
     )
 
 
 # ---- 9. get_insider_transactions ----
+
+
+def _shareholder_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _shareholder_quantity(value, unit="股") -> str:
+    number = _shareholder_number(value)
+    if number is None:
+        return "N/A"
+    if unit == "万股":
+        return f"{number:.2f}万股"
+    if abs(number) >= 1e8:
+        return f"{number / 1e8:.2f}亿股"
+    if abs(number) >= 1e4:
+        return f"{number / 1e4:.2f}万股"
+    return f"{number:.0f}股"
+
+
+def _shareholder_pct(value) -> str:
+    number = _shareholder_number(value)
+    return "N/A" if number is None else f"{number:.2f}%"
+
+
+def _shareholder_day(value) -> str:
+    if not isinstance(value, str):
+        return "N/A"
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return "N/A"
+
+
+def _shareholder_change(value, *, unit="股", direction=None) -> str:
+    number = _shareholder_number(value)
+    if number is None:
+        return "N/A"
+    if direction is None:
+        direction = "增持" if number > 0 else "减持" if number < 0 else "未变"
+    elif direction not in ("增持", "减持"):
+        direction = "方向未知"
+    return f"{direction} {_shareholder_quantity(abs(number), unit)}"
+
+
+def _shareholder_json(url, params, headers=None) -> dict:
+    response = _em_get(url, params=params, headers=headers, timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise TypeError("invalid_shareholder_payload")
+    return payload
+
+
+def _shareholder_rows(payload, key, code=None, required=()) -> list[dict]:
+    rows = payload.get(key)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise TypeError("invalid_shareholder_rows")
+    if code is not None and any(row.get("SECURITY_CODE") != code for row in rows):
+        raise ValueError("shareholder_ticker_mismatch")
+    if any(any(field not in row for field in required) for row in rows):
+        raise TypeError("missing_shareholder_fields")
+    return rows
+
+
+def _em_shareholder_research(code: str) -> str:
+    """Limited current shareholder snapshot; three independent native HTTP reads.
+
+    PageAjax quantities and executive CHANGE_NUM are shares. The shareholder
+    increase report's CHANGE_NUM/AFTER_HOLDER_NUM are ten-thousand shares;
+    DIRECTION, not the sign of CHANGE_NUM or CHANGE_RATE, supplies its direction.
+    """
+    sections: list[str] = []
+    failures: list[str] = []
+    successful_requests = 0
+    max_changes = 10
+    try:
+        payload = _shareholder_json(
+            "https://emweb.securities.eastmoney.com/PC_HSF10/ShareholderResearch/PageAjax",
+            {"code": f"{_get_prefix(code).upper()}{code}"},
+            {"Referer": "https://emweb.securities.eastmoney.com/"},
+        )
+        page_usable = False
+        for key, title in (("sjkzr", "实际控制人"), ("gdrs", "股东户数变化"),
+                           ("sdgd", "十大股东（最新一期）"), ("sdltgd", "十大流通股东（最新一期）")):
+            try:
+                required = ("HOLDER_NAME",) if key == "sjkzr" else ("END_DATE", "HOLDER_TOTAL_NUM") if key == "gdrs" else ("END_DATE", "HOLDER_NAME", "HOLD_NUM")
+                rows = _shareholder_rows(payload, key, required=required)[:10]
+                lines = [f"## {title}"]
+                if not rows:
+                    lines.append("本次查询无记录。")
+                elif key == "sjkzr":
+                    lines.extend(str(row.get("HOLDER_NAME") or "N/A") for row in rows)
+                elif key == "gdrs":
+                    lines.append("报告期 | 股东户数 | 户数环比 | 户均持股")
+                    lines.extend(f"{_shareholder_day(row.get('END_DATE'))} | {_shareholder_number(row.get('HOLDER_TOTAL_NUM')) if _shareholder_number(row.get('HOLDER_TOTAL_NUM')) is not None else 'N/A'} | "
+                                 f"{_shareholder_pct(row.get('TOTAL_NUM_RATIO'))} | {_shareholder_quantity(row.get('AVG_FREE_SHARES'))}"
+                                 for row in rows)
+                else:
+                    lines.append("报告期 | 股东 | 持股 | 持股比例 | 较上期变动")
+                    for row in rows:
+                        ratio = row.get("HOLD_NUM_RATIO")
+                        if ratio in (None, ""):
+                            ratio = row.get("FREE_HOLDNUM_RATIO")
+                        lines.append(f"{_shareholder_day(row.get('END_DATE'))} | {row.get('HOLDER_NAME') or 'N/A'} | "
+                                     f"{_shareholder_quantity(row.get('HOLD_NUM'))} | {_shareholder_pct(ratio)} | "
+                                     f"{_shareholder_change(row.get('HOLD_NUM_CHANGE'))}")
+                sections.append("\n".join(lines))
+                if any((not row.get("HOLDER_NAME") if key == "sjkzr" else
+                        _shareholder_day(row.get("END_DATE")) == "N/A" or
+                        _shareholder_number(row.get("HOLDER_TOTAL_NUM" if key == "gdrs" else "HOLD_NUM")) is None)
+                       for row in rows):
+                    failures.append(f"[数据缺失: 股东HTTP{title}关键日期或数值]")
+                page_usable = True
+            except Exception as exc:
+                failures.append(f"[数据缺失: 股东HTTP{title}] {safe_error(exc)}")
+        if page_usable:
+            successful_requests += 1
+    except Exception as exc:
+        failures.append(f"[数据缺失: 股东HTTP股东研究来源] {safe_error(exc)}")
+
+    for report, title, date_field in (("RPT_EXECUTIVE_HOLD_CHANGE", "高管增减持", "CHANGE_DATE"),
+                                      ("RPT_SHARE_HOLDER_INCREASE", "股东增减持", "NOTICE_DATE")):
+        try:
+            payload = _shareholder_json(_DATACENTER_URL, {
+                "reportName": report, "columns": "ALL", "filter": f'(SECURITY_CODE="{code}")',
+                "pageNumber": "1", "pageSize": str(max_changes), "sortColumns": date_field,
+                "sortTypes": "-1", "source": "WEB", "client": "WEB",
+            })
+            result = payload.get("result")
+            # Both report endpoints use this documented-by-observation tuple
+            # for a valid query with no matching records, rather than data=[].
+            if payload.get("success") is False and payload.get("code") == 9201 and result is None:
+                rows = []
+            else:
+                if payload.get("success") is False or not isinstance(result, dict):
+                    raise TypeError("invalid_shareholder_result")
+                required = ("CHANGE_DATE", "CHANGE_NUM") if report == "RPT_EXECUTIVE_HOLD_CHANGE" else ("NOTICE_DATE", "END_DATE", "CHANGE_NUM", "DIRECTION", "AFTER_HOLDER_NUM")
+                rows = _shareholder_rows(result, "data", code, required)[:max_changes]
+            successful_requests += 1
+            lines = [f"## {title}"]
+            if not rows:
+                lines.append("本次查询无记录。")
+            elif report == "RPT_EXECUTIVE_HOLD_CHANGE":
+                lines.append("变动日 | 姓名 | 变动 | 变动比例 | 均价(元)")
+                lines.extend(f"{_shareholder_day(row.get('CHANGE_DATE'))} | {row.get('EXECUTIVE_NAME') or row.get('HOLDER_NAME') or 'N/A'} | "
+                             f"{_shareholder_change(row.get('CHANGE_NUM'))} | {_shareholder_pct(row.get('CHANGE_RATIO'))} | "
+                             f"{_shareholder_number(row.get('AVERAGE_PRICE')) if _shareholder_number(row.get('AVERAGE_PRICE')) is not None else 'N/A'}"
+                             for row in rows)
+            else:
+                lines.append("公告日 | 变动截止日 | 股东 | 变动 | 变动后持股 | 变动后比例")
+                lines.extend(f"{_shareholder_day(row.get('NOTICE_DATE'))} | {_shareholder_day(row.get('END_DATE'))} | {row.get('HOLDER_NAME') or 'N/A'} | "
+                             f"{_shareholder_change(row.get('CHANGE_NUM'), unit='万股', direction=row.get('DIRECTION') or '')} | "
+                             f"{_shareholder_quantity(row.get('AFTER_HOLDER_NUM'), '万股')} | {_shareholder_pct(row.get('HOLD_RATIO'))}"
+                             for row in rows)
+            sections.append("\n".join(lines))
+            if any(_shareholder_day(row.get(date_field)) == "N/A" or
+                   _shareholder_number(row.get("CHANGE_NUM")) is None or
+                   (report == "RPT_SHARE_HOLDER_INCREASE" and
+                    (_shareholder_day(row.get("END_DATE")) == "N/A" or
+                     _shareholder_number(row.get("AFTER_HOLDER_NUM")) is None or
+                     row.get("DIRECTION") not in ("增持", "减持"))) for row in rows):
+                failures.append(f"[数据缺失: 股东HTTP{title}关键日期或数值]")
+        except Exception as exc:
+            failures.append(f"[数据缺失: 股东HTTP{title}] {safe_error(exc)}")
+
+    if not successful_requests:
+        # Explicit partial markers would make the existing recorder classify a
+        # total failure as partial. Preserve its native failed-result contract.
+        errors = [_re.sub(r"\[数据缺失: ([^\]]+)\]", r"\1:", failure) for failure in failures]
+        return f"Error retrieving insider/shareholder data for {code}:\n" + "\n".join(errors)
+    header = (f"# Shareholder Research for {code} (A-stock)\n"
+              "# Data source: 东方财富 F10 HTTP（mootdx不可用或无有效正文时的备用源）\n"
+              f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+              "# 最新时点、限量查询快照；报告期、公告日与变动日按来源字段显示，N/A表示未提供或无效。\n"
+              "# 不代表历史分析日已知事实、历史全文或完整逐笔内部人交易数据库。\n\n")
+    return header + "\n\n".join(sections + failures)
 
 
 def get_insider_transactions(
@@ -1696,36 +1907,37 @@ def get_insider_transactions(
     try:
         text = _mootdx_call("F10", symbol=code, name="股东研究")
 
-        if not text or not text.strip():
-            return f"No insider/shareholder data found for A-stock '{code}'"
+        if isinstance(text, str) and text.strip():
+            header = f"# Shareholder Research for {code} (A-stock)\n"
+            header += "# Note: A-stock equivalent of insider transactions\n"
+            header += "# Data source: mootdx F10\n"
+            header += (
+                f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
 
-        header = f"# Shareholder Research for {code} (A-stock)\n"
-        header += "# Note: A-stock equivalent of insider transactions\n"
-        header += "# Data source: mootdx F10\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
+            import re
 
-        import re
+            sec4_hits = list(re.finditer(r"\r?\n【4\.股东变化】\r?\n", text))
+            if sec4_hits:
+                sec4_pos = sec4_hits[-1].start()
+                before_sec4 = text[:sec4_pos]
+                sec4_text = text[sec4_pos:]
+                cut_at = 2000
+                if len(sec4_text) > cut_at:
+                    sec4_text = (
+                        sec4_text[:cut_at]
+                        + "\n\n(... older shareholder history omitted, "
+                        f"{len(text) - sec4_pos - cut_at} chars truncated ...)"
+                    )
+                text = before_sec4 + sec4_text
 
-        sec4_hits = list(re.finditer(r"\r?\n【4\.股东变化】\r?\n", text))
-        if sec4_hits:
-            sec4_pos = sec4_hits[-1].start()
-            before_sec4 = text[:sec4_pos]
-            sec4_text = text[sec4_pos:]
-            cut_at = 2000
-            if len(sec4_text) > cut_at:
-                sec4_text = (
-                    sec4_text[:cut_at]
-                    + "\n\n(... older shareholder history omitted, "
-                    f"{len(text) - sec4_pos - cut_at} chars truncated ...)"
-                )
-            text = before_sec4 + sec4_text
-
-        return header + text
-
+            return header + text
     except Exception as e:
-        return f"Error retrieving insider/shareholder data for {code}: {safe_error(e)}"
+        logger.warning("mootdx F10 failed for %s: %s; using shareholder HTTP source", code, safe_error(e))
+    try:
+        return _em_shareholder_research(code)
+    except Exception as exc:
+        return f"Error retrieving insider/shareholder data for {code}: {safe_error(exc)}"
 
 
 # ---- 10. get_profit_forecast ----
@@ -2244,70 +2456,75 @@ def get_fund_flow(
 
         # Historical daily fund flow (push2his)
         if include_history:
-            url_hist = (
-                "https://push2his.eastmoney.com"
-                "/api/qt/stock/fflow/daykline/get"
-            )
-            # 接口返回的是"从今天回溯 lmt 个交易日"，没有 end_date 参数。复盘一个
-            # 较早的日期时，若仍只要 20 天，过滤后会**一行不剩**——把"数据不对"
-            # 变成"没有数据"，比不过滤更糟。按分析日与今天的间隔把窗口放大到能
-            # 覆盖到那一段（上限 500，够回溯约两年）。
-            hist_limit = 20
-            if historical:
-                gap_days = (_market_today() - datetime.strptime(
-                    str(curr_date)[:10], "%Y-%m-%d").date()).days
-                # 日历日 → 交易日约 ×0.7，再多留 20 天余量
-                hist_limit = min(500, 20 + int(gap_days * 0.7) + 20)
-            params_hist = {
-                "secid": secid, "lmt": hist_limit, "klt": 101,
-                "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57",
-            }
-            rh = _em_get(url_hist, params=params_hist, timeout=10)
-            dh = rh.json()
-            hist_klines = dh.get("data", {}).get("klines", [])
+            try:
+                url_hist = (
+                    "https://push2his.eastmoney.com"
+                    "/api/qt/stock/fflow/daykline/get"
+                )
+                # 接口返回的是"从今天回溯 lmt 个交易日"，没有 end_date 参数。复盘一个
+                # 较早的日期时，若仍只要 20 天，过滤后会**一行不剩**——把"数据不对"
+                # 变成"没有数据"，比不过滤更糟。按分析日与今天的间隔把窗口放大到能
+                # 覆盖到那一段（上限 500，够回溯约两年）。
+                hist_limit = 20
+                if historical:
+                    gap_days = (_market_today() - datetime.strptime(
+                        str(curr_date)[:10], "%Y-%m-%d").date()).days
+                    # 日历日 → 交易日约 ×0.7，再多留 20 天余量
+                    hist_limit = min(500, 20 + int(gap_days * 0.7) + 20)
+                params_hist = {
+                    "secid": secid, "lmt": hist_limit, "klt": 101,
+                    "fields1": "f1,f2,f3,f7",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57",
+                }
+                rh = _em_get(url_hist, params=params_hist, timeout=10)
+                dh = rh.json()
+                hist_klines = dh.get("data", {}).get("klines", [])
 
-            # 逐行按分析日截断：接口返回的是"从今天回溯 20 个交易日"，
-            # 在历史日期上直接打印等于把未来的资金流喂给模型（未来函数）。
-            if historical:
-                cutoff = str(curr_date)[:10]
-                hist_klines = [
-                    k for k in hist_klines if k.split(",")[0][:10] <= cutoff
-                ]
-                # 窗口是为了"够回溯到分析日"才放大的，过滤完要裁回承诺的 20 个交易日。
-                # 不裁的话，复盘 90 天前会返回约 40 行——既改变了请求的趋势窗口，
-                # 又把每次情绪工具的返回体撑大一倍。
-                hist_klines = hist_klines[-20:]
+                # 逐行按分析日截断：接口返回的是"从今天回溯 20 个交易日"，
+                # 在历史日期上直接打印等于把未来的资金流喂给模型（未来函数）。
+                if historical:
+                    cutoff = str(curr_date)[:10]
+                    hist_klines = [
+                        k for k in hist_klines if k.split(",")[0][:10] <= cutoff
+                    ]
+                    # 窗口是为了"够回溯到分析日"才放大的，过滤完要裁回承诺的 20 个交易日。
+                    # 不裁的话，复盘 90 天前会返回约 40 行——既改变了请求的趋势窗口，
+                    # 又把每次情绪工具的返回体撑大一倍。
+                    hist_klines = hist_klines[-20:]
 
-            if historical and not hist_klines:
-                # 说清楚是"这个日期取不到"，而不是让正文里凭空少一段
-                lines.append(
-                    f"\n## Historical Daily Fund Flow\n"
-                    f"（{str(curr_date)[:10]} 及之前的资金流未能取到：该接口只提供"
-                    f"从今天回溯的窗口，分析日过早时可能已超出可回溯范围。）"
-                )
-            elif hist_klines:
-                lines.append(
-                    f"\n## Historical Daily Fund Flow "
-                    f"(last {len(hist_klines)} trading days"
-                    + (f", 截至 {str(curr_date)[:10]}" if historical else "")
-                    + ")"
-                )
-                lines.append(
-                    "Date | 主力净流入(万) | 大单(万) "
-                    "| 中单(万) | 小单(万) | 超大单(万)"
-                )
-                for line in hist_klines:
-                    parts = line.split(",")
-                    if len(parts) >= 6:
-                        lines.append(
-                            f"  {parts[0]} "
-                            f"| main={float(parts[1])/1e4:.0f} "
-                            f"| large={float(parts[4])/1e4:.0f} "
-                            f"| mid={float(parts[3])/1e4:.0f} "
-                            f"| small={float(parts[2])/1e4:.0f} "
-                            f"| super={float(parts[5])/1e4:.0f}"
-                        )
+                if historical and not hist_klines:
+                    # 说清楚是"这个日期取不到"，而不是让正文里凭空少一段
+                    lines.append(
+                        f"\n## Historical Daily Fund Flow\n"
+                        f"（{str(curr_date)[:10]} 及之前的资金流未能取到：该接口只提供"
+                        f"从今天回溯的窗口，分析日过早时可能已超出可回溯范围。）"
+                    )
+                elif hist_klines:
+                    lines.append(
+                        f"\n## Historical Daily Fund Flow "
+                        f"(last {len(hist_klines)} trading days"
+                        + (f", 截至 {str(curr_date)[:10]}" if historical else "")
+                        + ")"
+                    )
+                    lines.append(
+                        "Date | 主力净流入(万) | 大单(万) "
+                        "| 中单(万) | 小单(万) | 超大单(万)"
+                    )
+                    for line in hist_klines:
+                        parts = line.split(",")
+                        if len(parts) >= 6:
+                            lines.append(
+                                f"  {parts[0]} "
+                                f"| main={float(parts[1])/1e4:.0f} "
+                                f"| large={float(parts[4])/1e4:.0f} "
+                                f"| mid={float(parts[3])/1e4:.0f} "
+                                f"| small={float(parts[2])/1e4:.0f} "
+                                f"| super={float(parts[5])/1e4:.0f}"
+                            )
+            except Exception as exc:
+                if not klines:
+                    raise
+                lines.append(f"[数据缺失: 历史资金流查询失败] {safe_error(exc)}")
 
         return "\n".join(lines)
 

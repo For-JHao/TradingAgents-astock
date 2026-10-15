@@ -74,6 +74,30 @@ limits. It does not establish strict historical point-in-time financial values.
 No historical report, memory entry or missing-task record is migrated or rewritten
 by installing this baseline.
 
+## Native source reliability
+
+The stock data functions retain their original tool names and schemas. Valid
+mootdx F10 text remains preferred; an unavailable, empty or non-text result uses
+three bounded Eastmoney HTTP reads for shareholder research, executive changes
+and shareholder changes. Each section retains usable data when another source
+fails. Share counts, ten-thousand-share counts, direction and source dates are
+handled separately; these are limited current snapshots, not a historical
+point-in-time or complete insider transaction database. Structured empty lists
+and the observed datacenter `success=false/code=9201/result=null` no-record tuple
+remain healthy empty results. Other source/shape failures remain missing or
+failed through the existing recorder and safe error projection.
+
+Fund flow keeps the existing realtime-to-history request order and limits. A
+later historical failure retains available realtime output with an explicit gap;
+without realtime data it retains the native failed-result path. Macro news checks
+HTTP status before JSON, preserves the existing alternate source and distinguishes
+partial source failure, total failure and healthy empty responses.
+
+These data corrections do not change analyst prompts, tool schemas, graph nodes
+or edges, model routing, retries, memory, checkpoint or report publication. No
+source replacement is introduced for the unverified CLS endpoint; its failures
+are reported safely while the existing macro source remains available.
+
 ## Account-context publication and quote provenance
 
 New report metadata adds `contextVersion: 1`, the job's effective
