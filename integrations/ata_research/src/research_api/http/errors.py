@@ -1,3 +1,4 @@
-"""Safe public errors; engine errors use the same fixed projection."""
-def safe_error(error, stage="data"):
-    return f"Error: external_operation_failed ({stage})"
+"""Use the same integration-owned projection at HTTP, job and engine boundaries."""
+from tradingagents.safe_errors import safe_error
+
+__all__ = ["safe_error"]

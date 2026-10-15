@@ -33,9 +33,16 @@ memory and report publication. Ordinary company research remains native.
   are explicit and cannot produce a complete report.
 - `dataflows/resources.py` supplies fixed shared client/cache guards, atomic CSV
   writes and one Eastmoney request budget, used by the public provider too.
-- `safe_errors.py` projects exceptions before tool/node/log text. Third-party wire
-  debug logs are disabled at service startup. Exceptions are not persisted as
-  traceback or arbitrary response text.
+- `tradingagents/safe_errors.py` is an integration-owned finite shim (added locally,
+  not an upstream business module); `research_api.http.errors` re-exports the same
+  function. It preserves the generic `Error: external_operation_failed (stage)`
+  prefix and appends only fixed, type-based categories for known timeout,
+  connection, HTTP, JSON-decode, type, attribute and key errors. Unknown exceptions
+  retain the generic output. Stages are fixed and unsupported values become `data`.
+  Exception text, dynamic class names and request/response attributes are never
+  inspected. Third-party wire debug logs are disabled at service startup.
+  Exceptions are not persisted as traceback or arbitrary response text. Historical
+  generic failures cannot be retrospectively classified.
 
 New reports are privately generated and then hard-link published after fsync to
 `<ticker>/TradingAgentsStrategy_logs/full_states_log_<date>_<job_id>.json`.
